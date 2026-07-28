@@ -1,32 +1,37 @@
 # -*- coding: utf-8 -*-
 """
-개별종목 바닥확인 → 상승추세·매수구간 모니터 v2.0
+개별종목 바닥확인 → 상승추세·매수구간 모니터 v3.0
 ========================================
+2026-07-28 미국 종목 지원 추가판. v2.0 → v3.0 주요 변경:
 
-국내 개별종목을 다음 5단계로 자동 분류한다.
+  [신규 · 미국 종목 지원]
+  A. 감시 단위를 6자리 코드 하나에서 (시장, 심볼) 복합키로 확장.
+     내부 식별키는 "KR:005930", "US:NVDA" 형태의 uid를 쓴다.
+     한국 005930과 미국 티커가 겹쳐도 충돌하지 않는다.
+  B. 미국 종목은 야후 파이낸스 v8 chart(무인증·수정주가)로 일봉·현재가,
+     v1 search로 종목 검색. 상대강도 기준은 미국 S&P500(^GSPC).
+  C. 확정 종가 앵커를 시장별 정규장 마감으로 분리. KR 15:30 KST,
+     US 16:00 America/New_York.
+  D. 미국은 외국인/기관 수급·KRX 공매도·KRX 확정 대조가 모두 없으므로
+     해당 신호를 '해당 없음'으로 자동 제외한다. 미국은 공매도 압력이
+     진입점수에서 중립(50)으로 빠지고 나머지 축으로만 판정한다.
+     바닥형성/상승추세 만점을 시장별로 조정해 점수 표기 왜곡을 막는다.
+     호가단위·가격 포맷도 미국(달러·소수)과 한국(원·정수)으로 분기.
 
-  1) 하락 진행
-  2) 바닥 형성 관찰
-  3) 바닥 확인
-  4) 상승추세
-  5) 추세 훼손
+  [v2.0 공매도 로직 감사 수정]
+  E. evaluate_short_pressure의 reference_balance 기준일 버그 수정 —
+     "최근 10개 중 첫 값"(공시 간격에 따라 임의 과거일)이 아니라 실제
+     10영업일 이전에 가장 가까운 잔고를 anchor로 사용.
+  F. 공매도 거래일과 잔고 공시일이 서로 다른 날짜인데 한 판정에 섞이던
+     문제 — 두 최근일 간극이 5영업일을 넘으면 잔고 변화 가중을 줄인다.
+  G. _krx_stock_row의 `code in digits` 과다 매칭 제거(단축코드 정확
+     일치 → ISIN 위치 기반). higher_low/near_high 등 슬라이스 NaN 가드.
 
-판정 축:
-  - 바닥 형성: 신저가 중단, RSI 반등, 단기선 회복, 거래량 소진,
-               외국인·기관 수급, 시장 대비 상대강도
-  - 바닥 확인: MA20 2일 회복, 높아진 저점, MACD 양전환,
-               RSI 45 상회, OBV 개선
-  - 상승추세: 정배열, MA20·MA60 기울기, 20일 고점 접근,
-               상대강도, 외국인·기관 수급
-  - 추세 훼손: MA20 이탈, MA60 이탈, 20일 저점 이탈
-  - 매수 판단: 눌림목 구간, 돌파 확인가격, 추격 위험, 진입취소선
-  - 수급 판단: 외국인·기관 매수/매도 줄다리기, KRX 공매도 거래·잔고
-
-KRX 인증키는 코드에 넣지 않는다.
+미국은 인증 불필요. 한국 KRX 인증키는 코드에 넣지 않는다.
 Streamlit Cloud → Settings → Secrets:
 
-    KRX_AUTH_KEY = "발급받은 인증키"
-    WATCHLIST = "005930,000660,005380,000270"
+    KRX_AUTH_KEY = "발급받은 인증키"        # 한국 KRX 종가 대조용(선택)
+    WATCHLIST = "KR:005930,KR:000660,US:NVDA,US:AVGO"
 
 실행:
     streamlit run stock_bottom_trend_monitor.py
@@ -41,6 +46,12 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+
+try:
+    from zoneinfo import ZoneInfo
+    _US_TZ = ZoneInfo("America/New_York")
+except Exception:
+    _US_TZ = dt.timezone(dt.timedelta(hours=-5))
 
 
 # ──────────────────────────────────────────────────────────────
@@ -57,6 +68,74 @@ TODAY = dt.datetime.now(KST).date()
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 KRX_API_BASE = "https://data-dbg.krx.co.kr/svc/apis"
 KRX_DATA_URL = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+YF_BASE = "https://query1.finance.yahoo.com"
+
+MARKET_KR = "KR"
+MARKET_US = "US"
+VALID_MARKETS = (MARKET_KR, MARKET_US)
+
+MARKET_META = {
+    MARKET_KR: {
+        "tz": KST,
+        "close_time": dt.time(15, 30),
+        "currency": "원",
+        "price_fmt": "{:,.0f}",
+        "index_name": "KOSPI",
+        "has_investor_flow": True,
+        "has_short_selling": True,
+        "has_krx_confirm": True,
+    },
+    MARKET_US: {
+        "tz": _US_TZ,
+        "close_time": dt.time(16, 0),
+        "currency": "$",
+        "price_fmt": "{:,.2f}",
+        "index_name": "S&P500",
+        "has_investor_flow": False,
+        "has_short_selling": False,
+        "has_krx_confirm": False,
+    },
+}
+
+
+def make_uid(market: str, symbol: str) -> str:
+    return f"{market}:{symbol}"
+
+
+def split_uid(uid: str):
+    """uid → (market, symbol). 접두어 없으면 6자리 숫자는 KR, 나머지는 US로 추정."""
+    if ":" in uid:
+        market, symbol = uid.split(":", 1)
+        market = market.strip().upper()
+        symbol = symbol.strip().upper()
+        if market in VALID_MARKETS and symbol:
+            return market, symbol
+    token = uid.strip().upper()
+    digits = "".join(ch for ch in token if ch.isdigit())
+    if len(digits) == 6 and digits == token:
+        return MARKET_KR, digits
+    return MARKET_US, token
+
+
+def price_format(market: str):
+    return MARKET_META[market]["price_fmt"]
+
+
+def _money(value, market: str):
+    """시장별 통화 표기. KR: 12,300원 · US: $45.67"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    if market == MARKET_US:
+        return f"${value:,.2f}"
+    return f"{value:,.0f}원"
+
+
+def market_now(market: str) -> dt.datetime:
+    return dt.datetime.now(MARKET_META[market]["tz"])
+
+
+def market_today(market: str) -> dt.date:
+    return market_now(market).date()
 
 STAGE_ICON = {
     "하락 진행": "🔴",
@@ -98,20 +177,70 @@ def optional_number(value):
     return None if np.isnan(parsed) else parsed
 
 
-def parse_codes(raw: str):
-    codes = []
+def parse_watchlist(raw: str):
+    """감시목록 문자열을 uid 리스트로 파싱한다(시장 인지).
+
+    허용: "US:NVDA" "KR:005930" (권장) · "005930"(→KR) · "NVDA"(→US)
+    """
+    uids = []
     for token in raw.replace("\n", ",").split(","):
-        code = "".join(ch for ch in token.strip() if ch.isdigit())
-        if len(code) == 6 and code not in codes:
-            codes.append(code)
-    return codes[:20]
+        token = token.strip()
+        if not token:
+            continue
+        market, symbol = split_uid(token)
+        if market == MARKET_KR:
+            symbol = "".join(ch for ch in symbol if ch.isdigit())
+            if len(symbol) != 6:
+                continue
+        else:
+            symbol = "".join(
+                ch for ch in symbol.upper() if ch.isalnum() or ch in ".-"
+            )
+            if not symbol:
+                continue
+        uid = make_uid(market, symbol)
+        if uid not in uids:
+            uids.append(uid)
+    return uids[:20]
 
 
 # ──────────────────────────────────────────────────────────────
 # 1. 데이터 수집
 # ──────────────────────────────────────────────────────────────
+def quote_datetime(traded_at, market: str):
+    """시세 타임스탬프를 해당 시장 현지시각으로 파싱한다. 실패 시 None."""
+    if not traded_at:
+        return None
+    tz = MARKET_META[market]["tz"]
+    try:
+        parsed = dt.datetime.fromisoformat(str(traded_at))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=tz)
+    return parsed.astimezone(tz)
+
+
+def is_final_quote(traded_at, market: str):
+    """당일 정규장 마감(현지시각) 이후 시세인지 — 시장별 마감시각 적용."""
+    parsed = quote_datetime(traded_at, market)
+    if not parsed:
+        return False
+    return bool(
+        parsed.date() == market_today(market)
+        and parsed.time() >= MARKET_META[market]["close_time"]
+    )
+
+
+def apply_confirmed_cut(frame, market: str, final: bool):
+    """공식 판정용 앵커. 마감 확정 전에는 당일(현지) 행을 제외한다."""
+    if frame is None or frame.empty or final:
+        return frame
+    return frame[frame.index.date < market_today(market)]
+
+
 @st.cache_data(ttl=300, show_spinner=False)
-def search_stocks(query: str):
+def search_stocks_kr(query: str):
     """종목명 또는 6자리 코드로 KOSPI·KOSDAQ 보통주를 검색한다."""
     query = query.strip()
     if not query:
@@ -137,9 +266,10 @@ def search_stocks(query: str):
             and code.isdigit()
         ):
             results.append({
-                "code": code,
+                "market": MARKET_KR,
+                "symbol": code,
                 "name": item.get("name", code),
-                "market": item.get("typeName", item.get("typeCode", "")),
+                "exchange": item.get("typeName", item.get("typeCode", "")),
             })
         if len(results) >= 10:
             break
@@ -147,7 +277,7 @@ def search_stocks(query: str):
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_basic(code: str):
+def fetch_basic_kr(code: str):
     r = requests.get(
         f"https://m.stock.naver.com/api/stock/{code}/basic",
         headers=UA,
@@ -158,7 +288,8 @@ def fetch_basic(code: str):
     if not d.get("stockName"):
         raise ValueError("종목 기본정보 없음")
     return {
-        "code": code,
+        "market": MARKET_KR,
+        "symbol": code,
         "name": d.get("stockName", code),
         "price": optional_number(d.get("closePrice")),
         "change_pct": optional_number(d.get("fluctuationsRatio")),
@@ -170,7 +301,7 @@ def fetch_basic(code: str):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_price_history(code: str):
+def fetch_price_history_kr(code: str):
     r = requests.get(
         f"https://api.stock.naver.com/chart/domestic/item/{code}",
         params={"periodType": "dayCandle", "count": 260},
@@ -193,12 +324,9 @@ def fetch_price_history(code: str):
     })
     for col in ("open", "high", "low", "close", "volume"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    return (
-        df[["open", "high", "low", "close", "volume"]]
-        .dropna()
-        .sort_index()
-        .drop_duplicates()
-    )
+    df = df[["open", "high", "low", "close", "volume"]].dropna().sort_index()
+    # 인덱스(날짜) 기준 중복 제거(keep=last) — 같은날 다른값도 정리
+    return df[~df.index.duplicated(keep="last")]
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -236,7 +364,7 @@ def fetch_investor_trend(code: str):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_index_history(index_code: str):
-    """KOSPI 또는 KOSDAQ 일봉을 가져온다."""
+    """KOSPI 또는 KOSDAQ 일봉을 가져온다(한국 벤치마크)."""
     index_code = index_code.upper()
     if index_code not in ("KOSPI", "KOSDAQ"):
         raise ValueError("지원하지 않는 시장지수")
@@ -254,6 +382,136 @@ def fetch_index_history(index_code: str):
     df.index = pd.to_datetime(df["localDate"], format="%Y%m%d")
     df["close"] = pd.to_numeric(df["closePrice"], errors="coerce")
     return df[["close"]].dropna().sort_index()
+
+
+# ── 미국(야후 파이낸스, 무인증) ──
+def _yahoo_chart(symbol: str, rng: str = "2y", interval: str = "1d"):
+    r = requests.get(
+        f"{YF_BASE}/v8/finance/chart/{symbol}",
+        params={"range": rng, "interval": interval, "includePrePost": "false"},
+        headers=UA,
+        timeout=15,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    chart = payload.get("chart") or {}
+    if chart.get("error"):
+        raise ValueError(f"야후 오류: {chart['error']}")
+    result = chart.get("result") or []
+    if not result:
+        raise ValueError("야후 응답 비어 있음")
+    return result[0]
+
+
+def _yahoo_to_frame(result):
+    ts = result.get("timestamp") or []
+    quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    if not ts or not quote:
+        raise ValueError("야후 캔들 없음")
+    idx = pd.to_datetime(pd.Series(ts, dtype="int64"), unit="s", utc=True)
+    idx = idx.dt.tz_convert(_US_TZ).dt.normalize().dt.tz_localize(None)
+    df = pd.DataFrame({
+        "open": quote.get("open"),
+        "high": quote.get("high"),
+        "low": quote.get("low"),
+        "close": quote.get("close"),
+        "volume": quote.get("volume"),
+    })
+    df.index = idx
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["open", "high", "low", "close"]).sort_index()
+    df["volume"] = df["volume"].fillna(0)
+    return df[~df.index.duplicated(keep="last")]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def search_stocks_us(query: str):
+    query = query.strip()
+    if not query:
+        return []
+    r = requests.get(
+        f"{YF_BASE}/v1/finance/search",
+        params={"q": query, "quotesCount": 10, "newsCount": 0},
+        headers=UA,
+        timeout=12,
+    )
+    r.raise_for_status()
+    results = []
+    for q in r.json().get("quotes", []):
+        symbol = str(q.get("symbol", "")).strip().upper()
+        if not symbol or "." in symbol:
+            continue
+        if str(q.get("quoteType", "")).upper() not in ("EQUITY", "ETF"):
+            continue
+        results.append({
+            "market": MARKET_US,
+            "symbol": symbol,
+            "name": q.get("shortname") or q.get("longname") or symbol,
+            "exchange": q.get("exchDisp") or q.get("exchange") or "",
+        })
+        if len(results) >= 10:
+            break
+    return results
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_basic_us(symbol: str):
+    result = _yahoo_chart(symbol, rng="5d", interval="1d")
+    meta = result.get("meta") or {}
+    price = optional_number(meta.get("regularMarketPrice"))
+    prev = optional_number(
+        meta.get("chartPreviousClose") or meta.get("previousClose")
+    )
+    change_pct = None
+    if price is not None and prev not in (None, 0):
+        change_pct = (price / prev - 1) * 100
+    traded_at = ""
+    mkt_time = meta.get("regularMarketTime")
+    if mkt_time:
+        try:
+            traded_at = (
+                dt.datetime.fromtimestamp(int(mkt_time), tz=dt.timezone.utc)
+                .astimezone(_US_TZ)
+                .isoformat()
+            )
+        except (TypeError, ValueError, OverflowError):
+            traded_at = ""
+    return {
+        "market": MARKET_US,
+        "symbol": symbol,
+        "name": (
+            meta.get("longName") or meta.get("shortName")
+            or meta.get("symbol") or symbol
+        ),
+        "price": price,
+        "change_pct": change_pct,
+        "traded_at": traded_at,
+        "market_status": meta.get("marketState", ""),
+        "exchange": meta.get("fullExchangeName") or meta.get("exchangeName") or "",
+        "sosok": "",
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_price_history_us(symbol: str):
+    df = _yahoo_to_frame(_yahoo_chart(symbol, rng="2y", interval="1d"))
+    if len(df) < 80:
+        raise ValueError(f"일봉 표본 부족 ({len(df)}일)")
+    return df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_sp500_history():
+    return _yahoo_to_frame(_yahoo_chart("^GSPC", rng="2y", interval="1d"))[["close"]]
+
+
+def fetch_benchmark(market: str, sosok: str = ""):
+    """시장별 상대강도 기준지수. KR: KOSPI/KOSDAQ, US: S&P500."""
+    if market == MARKET_US:
+        return fetch_sp500_history(), "S&P500"
+    name = "KOSPI" if sosok == "0" else "KOSDAQ"
+    return fetch_index_history(name), name
 
 
 def _krx_numeric(value):
@@ -334,20 +592,39 @@ def fetch_short_selling(code: str, calendar_days: int = 70):
     )
 
 
-def fetch_bundle(code: str):
-    """한 종목의 기본정보·일봉·투자자 수급·공매도를 묶는다."""
-    basic = fetch_basic(code)
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        history_future = pool.submit(fetch_price_history, code)
-        investor_future = pool.submit(fetch_investor_trend, code)
-        short_future = pool.submit(fetch_short_selling, code)
-        history = history_future.result()
+def _fallback_basic(market: str, symbol: str, label: str = ""):
+    return {
+        "market": market, "symbol": symbol, "name": label or symbol,
+        "price": None, "change_pct": None, "traded_at": "",
+        "market_status": "", "exchange": "", "sosok": "",
+        "basic_failed": True,
+    }
+
+
+def fetch_bundle(uid: str, label: str = ""):
+    """한 종목의 기본정보·일봉·(한국)수급·공매도를 시장별로 묶는다."""
+    market, symbol = split_uid(uid)
+    empty_flow = pd.DataFrame(columns=["foreign", "institution", "individual"])
+    if market == MARKET_US:
+        history = fetch_price_history_us(symbol)
+        try:
+            basic = fetch_basic_us(symbol)
+        except Exception:
+            basic = _fallback_basic(market, symbol, label)
+        return basic, history, empty_flow, pd.DataFrame()
+    # 한국
+    history = fetch_price_history_kr(symbol)
+    try:
+        basic = fetch_basic_kr(symbol)
+    except Exception:
+        basic = _fallback_basic(market, symbol, label)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        investor_future = pool.submit(fetch_investor_trend, symbol)
+        short_future = pool.submit(fetch_short_selling, symbol)
         try:
             investor = investor_future.result()
         except Exception:
-            investor = pd.DataFrame(
-                columns=["foreign", "institution", "individual"]
-            )
+            investor = empty_flow
         try:
             short_selling = short_future.result()
         except Exception:
@@ -377,10 +654,17 @@ def _krx_rows(auth_key: str, endpoint: str, base_date: dt.date):
 
 
 def _krx_stock_row(rows, code: str):
+    """단축코드 정확 일치 → ISIN 위치 기반(KR7+종목코드). `code in digits`
+    식 부분 매칭은 다른 종목 오매칭 위험이 있어 제거 (v3.0 #G)."""
     for row in rows:
-        raw_code = str(row.get("ISU_SRT_CD") or row.get("ISU_CD") or "")
-        digits = "".join(ch for ch in raw_code if ch.isdigit())
-        if digits == code or digits.endswith(code) or code in digits:
+        short = str(row.get("ISU_SRT_CD", "")).strip().upper()
+        if short == code or short == "A" + code:
+            return row
+    for row in rows:
+        isin_digits = "".join(
+            ch for ch in str(row.get("ISU_CD", "")) if ch.isdigit()
+        )
+        if len(isin_digits) >= 7 and isin_digits[1:7] == code:
             return row
     return None
 
@@ -481,8 +765,10 @@ def relative_strength(stock: pd.DataFrame, benchmark: pd.DataFrame, window: int)
     return (stock_return - benchmark_return) * 100
 
 
-def tick_size(price: float):
-    """국내 주식 정규시장 가격대별 호가단위."""
+def tick_size(price: float, market: str = MARKET_KR):
+    """가격대별 호가단위. 미국은 $0.01 고정."""
+    if market == MARKET_US:
+        return 0.01
     if price < 2_000:
         return 1
     if price < 5_000:
@@ -498,16 +784,16 @@ def tick_size(price: float):
     return 1_000
 
 
-def round_to_tick(price: float, direction="nearest"):
+def round_to_tick(price: float, direction="nearest", market: str = MARKET_KR):
     if pd.isna(price):
         return np.nan
-    tick = tick_size(float(price))
+    tick = tick_size(float(price), market)
     units = float(price) / tick
     if direction == "up":
-        return float(math.ceil(units) * tick)
+        return round(float(math.ceil(units) * tick), 2)
     if direction == "down":
-        return float(math.floor(units) * tick)
-    return float(math.floor(units + 0.5) * tick)
+        return round(float(math.floor(units) * tick), 2)
+    return round(float(math.floor(units + 0.5) * tick), 2)
 
 
 def _flow_momentum(series: pd.Series):
@@ -607,6 +893,7 @@ def evaluate_short_pressure(
         "balance_change_pct": np.nan,
         "latest_trade_date": None,
         "latest_balance_date": None,
+        "balance_stale": False,
         "series": pd.DataFrame(),
     }
     if short_selling.empty or "short_volume" not in short_selling:
@@ -635,14 +922,29 @@ def evaluate_short_pressure(
         float(ratio_series.iloc[-1]) if not ratio_series.empty else np.nan
     )
     latest_balance = float(balances.iloc[-1]) if not balances.empty else np.nan
-    reference_balance = (
-        float(balances.tail(10).iloc[0]) if len(balances) >= 2 else np.nan
-    )
+
+    # v3.0 수정 #E: 잔고 변화 기준일을 "최근 10개 중 첫 값"(공시 간격에 따라
+    # 임의 과거일)이 아니라 실제 10영업일(≈14일) 이전에 가장 가까운 잔고로.
+    reference_balance = np.nan
+    if len(balances) >= 2:
+        target_date = balances.index[-1] - pd.Timedelta(days=14)
+        earlier = balances[balances.index <= target_date]
+        if not earlier.empty:
+            reference_balance = float(earlier.iloc[-1])
+        else:
+            reference_balance = float(balances.iloc[0])
     balance_change_pct = (
         (latest_balance / reference_balance - 1) * 100
         if pd.notna(reference_balance) and reference_balance > 0
         else np.nan
     )
+
+    # v3.0 수정 #F: 공매도 거래 최근일과 잔고 공시 최근일이 크게 어긋나면
+    # (5영업일≈7일 초과) 잔고 신호 신뢰도를 낮춘다.
+    balance_stale = False
+    if not ratio_series.empty and not balances.empty:
+        gap_days = abs((ratio_series.index[-1] - balances.index[-1]).days)
+        balance_stale = gap_days > 7
 
     if (
         (pd.notna(balance_change_pct) and balance_change_pct > 10)
@@ -685,12 +987,14 @@ def evaluate_short_pressure(
         elif avg5 >= previous5 * 1.2:
             score -= 10
     if pd.notna(balance_change_pct):
+        # 잔고 공시가 거래일과 크게 어긋나면 가중치 절반으로 (v3.0 #F)
+        w = 0.5 if balance_stale else 1.0
         if balance_change_pct > 10:
-            score -= 25
+            score -= int(round(25 * w))
         elif balance_change_pct > 3:
-            score -= 10
+            score -= int(round(10 * w))
         elif balance_change_pct <= -5:
-            score += 10
+            score += int(round(10 * w))
 
     return {
         "available": True,
@@ -707,6 +1011,7 @@ def evaluate_short_pressure(
         "latest_balance_date": (
             balances.index[-1] if not balances.empty else None
         ),
+        "balance_stale": balance_stale,
         "series": series,
     }
 
@@ -716,6 +1021,7 @@ def build_entry_plan(
     df: pd.DataFrame,
     flow: dict,
     short_pressure: dict,
+    market: str = MARKET_KR,
 ):
     """추세 상태와 가격·수급·공매도를 합쳐 조건부 매수계획을 만든다."""
     last = df.iloc[-1]
@@ -726,19 +1032,21 @@ def build_entry_plan(
     rsi = float(last["rsi14"])
     prior20_high = float(df["high"].iloc[-21:-1].max())
     breakout_trigger = round_to_tick(
-        prior20_high + tick_size(prior20_high),
-        "up",
+        prior20_high + tick_size(prior20_high, market),
+        "up", market,
     )
 
     pullback_low_raw = max(ma20, ma5 - atr * 0.10)
     pullback_high_raw = min(close, ma5 + atr * 0.30)
-    pullback_low = round_to_tick(pullback_low_raw)
-    pullback_high = round_to_tick(max(pullback_low_raw, pullback_high_raw))
-    entry_cancel = round_to_tick(
-        pullback_low - tick_size(pullback_low),
-        "down",
+    pullback_low = round_to_tick(pullback_low_raw, "nearest", market)
+    pullback_high = round_to_tick(
+        max(pullback_low_raw, pullback_high_raw), "nearest", market
     )
-    trend_invalidation = round_to_tick(ma20)
+    entry_cancel = round_to_tick(
+        pullback_low - tick_size(pullback_low, market),
+        "down", market,
+    )
+    trend_invalidation = round_to_tick(ma20, "nearest", market)
 
     avg20_volume = float(df["volume"].tail(20).mean())
     volume_ratio = (
@@ -872,19 +1180,31 @@ def build_entry_plan(
             "공매도": short_component,
         },
         "buy_condition": (
-            f"눌림목 {pullback_low:,.0f}~{pullback_high:,.0f}원에서 "
+            f"눌림목 {_money(pullback_low, market)}~"
+            f"{_money(pullback_high, market)}에서 "
             "거래량 감소 후 양봉 전환, 또는 "
-            f"{breakout_trigger:,.0f}원 이상 종가+거래량 1.3배"
+            f"{_money(breakout_trigger, market)} 이상 종가+거래량 1.3배"
         ),
         "cancel_condition": (
-            f"눌림 진입 후 {entry_cancel:,.0f}원 종가 이탈 시 진입가설 재검토. "
-            f"MA20 부근 {trend_invalidation:,.0f}원 2일 이탈 시 추세 재판정"
+            f"눌림 진입 후 {_money(entry_cancel, market)} 종가 이탈 시 "
+            f"진입가설 재검토. MA20 부근 {_money(trend_invalidation, market)} "
+            "2일 이탈 시 추세 재판정"
         ),
     }
 
 
 def _signal(label, passed, detail):
     return {"label": label, "passed": bool(passed), "detail": detail}
+
+
+def _safe_min(series):
+    s = series.dropna()
+    return float(s.min()) if len(s) else np.nan
+
+
+def _safe_max(series):
+    s = series.dropna()
+    return float(s.max()) if len(s) else np.nan
 
 
 def evaluate_stock(
@@ -895,6 +1215,9 @@ def evaluate_stock(
     benchmark: pd.DataFrame,
     benchmark_name: str,
 ):
+    market = basic.get("market", MARKET_KR)
+    has_flow = MARKET_META[market]["has_investor_flow"]
+    pfmt = price_format(market)
     df = add_indicators(raw_history)
     if len(df) < 80:
         raise ValueError("기술지표 계산 표본 부족")
@@ -956,7 +1279,7 @@ def evaluate_stock(
         _signal(
             "5일선 회복",
             ma5_recovery,
-            f"종가 {close:,.0f} / MA5 {last['ma5']:,.0f}",
+            f"종가 {pfmt.format(close)} / MA5 {pfmt.format(last['ma5'])}",
         ),
         _signal(
             "매도 거래량 소진·투매반전",
@@ -965,7 +1288,9 @@ def evaluate_stock(
             "최근 10일 투매 후 종가회복" if capitulation_reversal else
             "거래량 소진 미확인",
         ),
-        _signal(
+    ]
+    if has_flow:
+        formation.append(_signal(
             "외국인·기관 5일 줄다리기",
             flow5_positive,
             (
@@ -973,32 +1298,36 @@ def evaluate_stock(
                 if flow_available
                 else "수급 데이터 없음"
             ),
-        ),
-        _signal(
-            f"{benchmark_name} 대비 10일 상대강도",
-            pd.notna(rs10) and rs10 > 0,
-            f"{rs10:+.2f}%p" if pd.notna(rs10) else "계산불가",
-        ),
-    ]
+        ))
+    formation.append(_signal(
+        f"{benchmark_name} 대비 10일 상대강도",
+        pd.notna(rs10) and rs10 > 0,
+        f"{rs10:+.2f}%p" if pd.notna(rs10) else "계산불가",
+    ))
+    formation_max = len(formation)
 
     above_ma20_two_days = bool((df["close"].tail(2) > df["ma20"].tail(2)).all())
-    recent_low = df["low"].iloc[-10:].min()
-    prior_low = df["low"].iloc[-20:-10].min()
-    higher_low = pd.notna(prior_low) and recent_low > prior_low
+    recent_low = _safe_min(df["low"].iloc[-10:])
+    prior_low = _safe_min(df["low"].iloc[-20:-10])
+    higher_low = (
+        pd.notna(prior_low) and pd.notna(recent_low) and recent_low > prior_low
+    )
     macd_positive = last["macd_hist"] > 0
     rsi_confirmed = rsi > 45
     obv_improving = last["obv"] > df["obv"].iloc[-6]
+    prior_low_txt = pfmt.format(prior_low) if pd.notna(prior_low) else "—"
+    recent_low_txt = pfmt.format(recent_low) if pd.notna(recent_low) else "—"
 
     confirmation = [
         _signal(
             "MA20 2일 연속 회복",
             above_ma20_two_days,
-            f"종가 {close:,.0f} / MA20 {last['ma20']:,.0f}",
+            f"종가 {pfmt.format(close)} / MA20 {pfmt.format(last['ma20'])}",
         ),
         _signal(
             "높아진 저점",
             higher_low,
-            f"직전10일 저점 {prior_low:,.0f} → 최근10일 {recent_low:,.0f}",
+            f"직전10일 저점 {prior_low_txt} → 최근10일 {recent_low_txt}",
         ),
         _signal(
             "MACD 모멘텀 양전환",
@@ -1018,16 +1347,18 @@ def evaluate_stock(
         last["ma20"] > df["ma20"].iloc[-6]
         and last["ma60"] >= df["ma60"].iloc[-11]
     )
-    prior20_high = df["high"].iloc[-21:-1].max()
-    near_high = close >= prior20_high * 0.95
+    prior20_high = _safe_max(df["high"].iloc[-21:-1])
+    near_high = pd.notna(prior20_high) and close >= prior20_high * 0.95
     rs20_positive = pd.notna(rs20) and rs20 > 0
     flow10_positive = flow_available and flow10 > 0
+    prior20_high_txt = pfmt.format(prior20_high) if pd.notna(prior20_high) else "—"
 
     uptrend = [
         _signal(
             "종가 > MA20 > MA60",
             ordered,
-            f"{close:,.0f} > {last['ma20']:,.0f} > {last['ma60']:,.0f}",
+            f"{pfmt.format(close)} > {pfmt.format(last['ma20'])} > "
+            f"{pfmt.format(last['ma60'])}",
         ),
         _signal(
             "중기선 기울기 상승",
@@ -1038,14 +1369,16 @@ def evaluate_stock(
         _signal(
             "20일 고점 접근·돌파",
             near_high,
-            f"종가 {close:,.0f} / 직전20일 고점 {prior20_high:,.0f}",
+            f"종가 {pfmt.format(close)} / 직전20일 고점 {prior20_high_txt}",
         ),
         _signal(
             f"{benchmark_name} 대비 20일 상대강도",
             rs20_positive,
             f"{rs20:+.2f}%p" if pd.notna(rs20) else "계산불가",
         ),
-        _signal(
+    ]
+    if has_flow:
+        uptrend.append(_signal(
             "외국인·기관 10일 수급",
             flow10_positive,
             (
@@ -1053,29 +1386,30 @@ def evaluate_stock(
                 if flow_available
                 else "수급 데이터 없음"
             ),
-        ),
-    ]
+        ))
+    uptrend_max = len(uptrend)
 
     below_ma20_two_days = bool((df["close"].tail(2) < df["ma20"].tail(2)).all())
     ma20_falling = last["ma20"] < df["ma20"].iloc[-6]
     below_ma60 = close < last["ma60"]
-    prior20_low = df["low"].iloc[-21:-1].min()
-    broke_20d_low = close < prior20_low
+    prior20_low = _safe_min(df["low"].iloc[-21:-1])
+    broke_20d_low = pd.notna(prior20_low) and close < prior20_low
+    prior20_low_txt = pfmt.format(prior20_low) if pd.notna(prior20_low) else "—"
     breakdown = [
         _signal(
             "MA20 2일 이탈+기울기 하락",
             below_ma20_two_days and ma20_falling,
-            f"종가 {close:,.0f} / MA20 {last['ma20']:,.0f}",
+            f"종가 {pfmt.format(close)} / MA20 {pfmt.format(last['ma20'])}",
         ),
         _signal(
             "MA60 이탈",
             below_ma60,
-            f"종가 {close:,.0f} / MA60 {last['ma60']:,.0f}",
+            f"종가 {pfmt.format(close)} / MA60 {pfmt.format(last['ma60'])}",
         ),
         _signal(
             "직전 20일 저점 이탈",
             broke_20d_low,
-            f"종가 {close:,.0f} / 직전20일 저점 {prior20_low:,.0f}",
+            f"종가 {pfmt.format(close)} / 직전20일 저점 {prior20_low_txt}",
         ),
     ]
 
@@ -1090,16 +1424,20 @@ def evaluate_stock(
         & (df["ma20"] > df["ma20"].shift(5))
     ).tail(20).fillna(False).any()
 
+    # 수급 신호가 빠진 미국은 만점이 낮으므로 임계값을 비례 조정 (v3.0 #D)
+    form_threshold = 3 if formation_max >= 6 else max(2, round(formation_max * 0.5))
+    up_threshold = 3 if uptrend_max >= 5 else max(2, round(uptrend_max * 0.6))
+
     if historical_uptrend and breakdown_score >= 2:
         stage = "추세 훼손"
         action = "기존 상승추세가 훼손됨. 신규진입보다 위험 재평가 우선"
-    elif uptrend_score >= 3 and close > last["ma20"]:
+    elif uptrend_score >= up_threshold and close > last["ma20"]:
         stage = "상승추세"
         action = "추세 유지 여부 관찰. 과열이면 추격 금지"
     elif confirmation_score >= 3 and above_ma20_two_days:
         stage = "바닥 확인"
         action = "바닥 후보가 가격으로 확인되는 단계. 종가 기준 재확인"
-    elif formation_score >= 3:
+    elif formation_score >= form_threshold:
         stage = "바닥 형성 관찰"
         action = "아직 바닥 확정 아님. MA20 회복과 높아진 저점 대기"
     else:
@@ -1116,9 +1454,10 @@ def evaluate_stock(
         overheat_reasons.append(f"5일 +{return5:.1f}%")
 
     short_pressure = evaluate_short_pressure(short_selling, raw_history)
-    entry = build_entry_plan(stage, df, flow, short_pressure)
+    entry = build_entry_plan(stage, df, flow, short_pressure, market)
     drawdown60 = (close / df["high"].tail(60).max() - 1) * 100
     result = {
+        "market": market,
         "basic": basic,
         "history": df,
         "investor": investor,
@@ -1134,6 +1473,8 @@ def evaluate_stock(
         "confirmation_score": confirmation_score,
         "uptrend_score": uptrend_score,
         "breakdown_score": breakdown_score,
+        "formation_max": formation_max,
+        "uptrend_max": uptrend_max,
         "rsi": rsi,
         "rs20": rs20,
         "drawdown60": drawdown60,
@@ -1152,150 +1493,212 @@ def evaluate_stock(
 # ──────────────────────────────────────────────────────────────
 st.title("📈 개별종목 상승추세·매수구간 모니터")
 st.caption(
-    "바닥·상승추세뿐 아니라 눌림목 가격, 돌파 확인가격, 추격 위험, "
-    "외국인·기관 줄다리기와 KRX 공매도 압력을 자동 판정합니다."
+    "한국·미국 개별종목의 바닥·상승추세, 눌림목·돌파 가격, 추격 위험을 판정합니다. "
+    "한국은 외국인·기관 줄다리기와 KRX 공매도 압력까지, 미국은 가격·거래량·"
+    "상대강도 기반으로 자동 판정합니다."
 )
 
 default_watchlist = _secret(
     "WATCHLIST",
-    "005930,000660,005380,000270,035420,035720",
+    "KR:005930,KR:000660,KR:005380,US:NVDA,US:AVGO,US:GOOGL",
 )
 krx_auth_key = _secret("KRX_AUTH_KEY")
 
-query_watchlist = parse_codes(st.query_params.get("stocks", ""))
-if "watchlist_codes" not in st.session_state:
-    st.session_state["watchlist_codes"] = (
-        query_watchlist or parse_codes(default_watchlist)
+query_watchlist = parse_watchlist(st.query_params.get("stocks", ""))
+if "watchlist_uids" not in st.session_state:
+    st.session_state["watchlist_uids"] = (
+        query_watchlist or parse_watchlist(default_watchlist)
     )
 if "stock_labels" not in st.session_state:
     st.session_state["stock_labels"] = {}
 
 
 def sync_watchlist_url():
-    current = st.session_state["watchlist_codes"]
+    current = st.session_state["watchlist_uids"]
     if current:
         st.query_params["stocks"] = ",".join(current)
     elif "stocks" in st.query_params:
         del st.query_params["stocks"]
 
 
+def uid_display(uid: str):
+    market, symbol = split_uid(uid)
+    label = st.session_state["stock_labels"].get(uid)
+    flag = "🇰🇷" if market == MARKET_KR else "🇺🇸"
+    return f"{flag} {label} ({symbol})" if label else f"{flag} {symbol}"
+
+
 with st.sidebar:
     st.header("🔎 종목 검색")
-    search_query = st.text_input(
-        "종목명 또는 종목코드",
-        placeholder="예: 삼성전자, 하이닉스, 005930",
+    market_choice = st.radio(
+        "시장",
+        [MARKET_KR, MARKET_US],
+        format_func=lambda m: "🇰🇷 한국" if m == MARKET_KR else "🇺🇸 미국",
+        horizontal=True,
     )
+    placeholder = (
+        "예: 삼성전자, 하이닉스, 005930"
+        if market_choice == MARKET_KR
+        else "예: NVIDIA, NVDA, AAPL"
+    )
+    search_query = st.text_input("종목명 또는 티커/코드", placeholder=placeholder)
+
     search_results = []
     if search_query.strip():
         try:
-            search_results = search_stocks(search_query)
+            search_results = (
+                search_stocks_us(search_query)
+                if market_choice == MARKET_US
+                else search_stocks_kr(search_query)
+            )
         except Exception as exc:
             st.warning(f"종목 검색 실패: {exc}")
 
     if search_results:
-        result_map = {item["code"]: item for item in search_results}
-        selected_search_code = st.selectbox(
+        result_map = {item["symbol"]: item for item in search_results}
+        picked_symbol = st.selectbox(
             "검색 결과",
             list(result_map),
-            format_func=lambda code: (
-                f"{result_map[code]['name']} ({code}) · "
-                f"{result_map[code]['market']}"
+            format_func=lambda s: (
+                f"{result_map[s]['name']} ({s}) · {result_map[s]['exchange']}"
             ),
         )
         if st.button("➕ 감시목록에 추가", type="primary"):
-            current = st.session_state["watchlist_codes"]
-            if selected_search_code in current:
+            picked = result_map[picked_symbol]
+            uid = make_uid(picked["market"], picked["symbol"])
+            current = st.session_state["watchlist_uids"]
+            if uid in current:
                 st.info("이미 감시 중인 종목입니다.")
             elif len(current) >= 20:
                 st.warning("감시종목은 최대 20개입니다.")
             else:
-                current.append(selected_search_code)
-                selected_item = result_map[selected_search_code]
-                st.session_state["stock_labels"][selected_search_code] = (
-                    selected_item["name"]
-                )
+                current.append(uid)
+                st.session_state["stock_labels"][uid] = picked["name"]
                 sync_watchlist_url()
                 st.rerun()
     elif search_query.strip():
-        st.info("KOSPI·KOSDAQ 종목 검색 결과가 없습니다.")
+        label = "KOSPI·KOSDAQ" if market_choice == MARKET_KR else "미국 상장"
+        st.info(f"{label} 종목 검색 결과가 없습니다.")
 
     st.divider()
     st.subheader("현재 감시목록")
-    current_codes = st.session_state["watchlist_codes"]
-    if current_codes:
-        remove_codes = st.multiselect(
-            "삭제할 종목 선택",
-            current_codes,
-            format_func=lambda code: (
-                f"{st.session_state['stock_labels'].get(code, code)} ({code})"
-                if code in st.session_state["stock_labels"]
-                else code
-            ),
+    current_uids = st.session_state["watchlist_uids"]
+    if current_uids:
+        remove_uids = st.multiselect(
+            "삭제할 종목 선택", current_uids, format_func=uid_display
         )
-        if st.button("🗑️ 선택 종목 삭제", disabled=not remove_codes):
-            st.session_state["watchlist_codes"] = [
-                code for code in current_codes if code not in remove_codes
+        if st.button("🗑️ 선택 종목 삭제", disabled=not remove_uids):
+            st.session_state["watchlist_uids"] = [
+                u for u in current_uids if u not in remove_uids
             ]
             sync_watchlist_url()
             st.rerun()
-        st.caption(f"{len(current_codes)}개 / 최대 20개")
+        kr_n = sum(1 for u in current_uids if split_uid(u)[0] == MARKET_KR)
+        us_n = len(current_uids) - kr_n
+        st.caption(f"{len(current_uids)}개 (🇰🇷{kr_n} · 🇺🇸{us_n}) / 최대 20개")
     else:
         st.info("검색 후 종목을 추가하세요.")
 
     st.divider()
     if krx_auth_key:
-        st.success("KRX 종가 대조용 Open API 키 설정됨")
+        st.success("KRX 종가 대조용 Open API 키 설정됨 (한국)")
     else:
-        st.info("KRX 종가 대조키 미설정 · 공매도 통계는 자동수집")
+        st.info("KRX 종가 대조키 미설정 · 한국 공매도 통계는 자동수집")
     if st.button("🔄 데이터 새로고침"):
         st.cache_data.clear()
         st.rerun()
-    st.caption("장중 60초 자동 갱신")
+    st.caption("장중(한국·미국) 60초 자동 갱신")
 
-try:
-    from streamlit_autorefresh import st_autorefresh
-    st_autorefresh(interval=60_000, key="stock-monitor-refresh")
-except Exception:
-    pass
+kr_now = dt.datetime.now(KST)
+kr_open = kr_now.weekday() < 5 and dt.time(8, 30) <= kr_now.time() < dt.time(15, 45)
+us_now = dt.datetime.now(_US_TZ)
+us_open = us_now.weekday() < 5 and dt.time(9, 0) <= us_now.time() < dt.time(16, 15)
+if kr_open or us_open:
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=60_000, key="stock-monitor-refresh")
+    except Exception:
+        pass
 
-codes = list(st.session_state["watchlist_codes"])
-if not codes:
+uids = list(st.session_state["watchlist_uids"])
+if not uids:
     st.info("왼쪽 검색창에서 감시할 종목을 추가하세요.")
     st.stop()
 
-try:
-    with ThreadPoolExecutor(max_workers=2) as benchmark_pool:
-        benchmark_futures = {
-            name: benchmark_pool.submit(fetch_index_history, name)
-            for name in ("KOSPI", "KOSDAQ")
-        }
-        market_history = {
-            name: future.result()
-            for name, future in benchmark_futures.items()
-        }
-except Exception as exc:
-    st.error(f"시장 상대강도 기준 데이터 수집 실패: {exc}")
-    st.stop()
+# 시장별 벤치마크는 한 번씩만 수집. 한국은 sosok을 아직 모르므로 둘 다,
+# 미국은 S&P500. (실패해도 해당 종목은 상대강도 계산불가로만 처리)
+benchmark_cache, benchmark_errors = {}, {}
+markets_present = {split_uid(u)[0] for u in uids}
+if MARKET_KR in markets_present:
+    for name in ("KOSPI", "KOSDAQ"):
+        try:
+            benchmark_cache[name] = fetch_index_history(name)
+        except Exception as exc:
+            benchmark_errors[name] = str(exc)
+if MARKET_US in markets_present:
+    try:
+        benchmark_cache["S&P500"] = fetch_sp500_history()
+    except Exception as exc:
+        benchmark_errors["S&P500"] = str(exc)
+if benchmark_errors:
+    st.warning(
+        "상대강도 기준지수 수집 실패: "
+        + " / ".join(f"{k}({v})" for k, v in benchmark_errors.items())
+        + " — 해당 시장 종목의 상대강도는 계산불가로 표시됩니다."
+    )
 
+empty_benchmark = pd.DataFrame(columns=["close"])
+labels = st.session_state["stock_labels"]
 analyses, failures = {}, {}
-with st.spinner(f"{len(codes)}개 종목 자동 분석..."):
-    with ThreadPoolExecutor(max_workers=min(8, len(codes))) as pool:
-        future_map = {pool.submit(fetch_bundle, code): code for code in codes}
+with st.spinner(f"{len(uids)}개 종목 자동 분석..."):
+    with ThreadPoolExecutor(max_workers=min(8, len(uids))) as pool:
+        future_map = {
+            pool.submit(fetch_bundle, uid, labels.get(uid, "")): uid
+            for uid in uids
+        }
         for future in as_completed(future_map):
-            code = future_map[future]
+            uid = future_map[future]
+            market, symbol = split_uid(uid)
             try:
                 basic, history, investor, short_selling = future.result()
-                benchmark_name = "KOSPI" if basic["sosok"] == "0" else "KOSDAQ"
-                analyses[code] = evaluate_stock(
-                    basic,
-                    history,
-                    investor,
-                    short_selling,
-                    market_history[benchmark_name],
-                    benchmark_name,
+                if market == MARKET_US:
+                    benchmark_name = "S&P500"
+                else:
+                    benchmark_name = "KOSPI" if basic["sosok"] == "0" else "KOSDAQ"
+                benchmark_df = benchmark_cache.get(benchmark_name, empty_benchmark)
+                final_quote = is_final_quote(basic.get("traded_at"), market)
+                today_local = market_today(market)
+                partial_dropped = (
+                    not final_quote
+                    and len(history) > 0
+                    and history.index[-1].date() == today_local
                 )
+                conf_hist = apply_confirmed_cut(history, market, final_quote)
+                conf_inv = apply_confirmed_cut(investor, market, final_quote)
+                result = evaluate_stock(
+                    basic, conf_hist, conf_inv, short_selling,
+                    benchmark_df, benchmark_name,
+                )
+                result["uid"] = uid
+                result["symbol"] = symbol
+                result["final_quote"] = final_quote
+                result["partial_dropped"] = partial_dropped
+                result["live_stage"] = None
+                if partial_dropped:
+                    try:
+                        live = evaluate_stock(
+                            basic, history, investor, short_selling,
+                            benchmark_df, benchmark_name,
+                        )
+                        if live["stage"] != result["stage"]:
+                            result["live_stage"] = live["stage"]
+                    except Exception:
+                        pass
+                if result["basic"].get("price") is None and len(conf_hist):
+                    result["basic"]["price"] = float(conf_hist["close"].iloc[-1])
+                analyses[uid] = result
             except Exception as exc:
-                failures[code] = str(exc)
+                failures[uid] = str(exc)
 
 if failures:
     st.warning(
@@ -1307,40 +1710,46 @@ if not analyses:
     st.stop()
 
 summary_rows = []
-for code, result in analyses.items():
+for uid, result in analyses.items():
+    market, symbol = split_uid(uid)
     basic = result["basic"]
     entry = result["entry"]
     flow = result["flow"]
     short_pressure = result["short_pressure"]
-    st.session_state["stock_labels"][code] = basic["name"]
+    if basic["name"] != symbol:
+        st.session_state["stock_labels"][uid] = basic["name"]
+    flag = "🇰🇷" if market == MARKET_KR else "🇺🇸"
+    live_stage = result.get("live_stage")
+    pl = entry["pullback_low"]
+    ph = entry["pullback_high"]
     summary_rows.append({
         "우선순위": STAGE_RANK[result["stage"]],
+        "_score": entry["score"],
+        "시장": flag,
         "종목": basic["name"],
-        "코드": code,
+        "심볼": symbol,
         "단계": f"{STAGE_ICON[result['stage']]} {result['stage']}",
+        "장중잠정": (f"{STAGE_ICON[live_stage]} {live_stage}" if live_stage else ""),
         "매수판정": entry["status"],
         "진입점수": entry["score"],
         "현재가": basic["price"],
         "등락률(%)": basic["change_pct"],
-        "눌림목 가격": (
-            f"{entry['pullback_low']:,.0f}~{entry['pullback_high']:,.0f}"
-        ),
-        "돌파가격": entry["breakout_trigger"],
-        "진입취소선": entry["entry_cancel"],
+        "눌림목 가격": f"{_money(pl, market)}~{_money(ph, market)}",
+        "돌파가격": _money(entry["breakout_trigger"], market),
+        "진입취소선": _money(entry["entry_cancel"], market),
         "수급 줄다리기": flow["label"],
         "공매도": short_pressure["label"],
         "RSI14": result["rsi"],
-        "시장대비20일(%p)": result["rs20"],
+        "지수대비20일(%p)": result["rs20"],
     })
 
 summary = (
     pd.DataFrame(summary_rows)
-    .sort_values(
-        ["진입점수", "우선순위"],
-        ascending=[False, True],
-    )
-    .drop(columns="우선순위")
+    .sort_values(["_score", "우선순위"], ascending=[False, True])
+    .drop(columns=["우선순위", "_score"])
 )
+if (summary["장중잠정"] == "").all():
+    summary = summary.drop(columns=["장중잠정"])
 
 st.subheader("전체 감시판 · 매수 타이밍 우선")
 st.dataframe(
@@ -1348,54 +1757,76 @@ st.dataframe(
     width="stretch",
     hide_index=True,
     column_config={
-        "현재가": st.column_config.NumberColumn(format="%,.0f"),
+        "현재가": st.column_config.NumberColumn(format="localized"),
         "등락률(%)": st.column_config.NumberColumn(format="%+.2f"),
         "진입점수": st.column_config.ProgressColumn(
-            min_value=0,
-            max_value=100,
-            format="%d",
+            min_value=0, max_value=100, format="%d",
         ),
-        "돌파가격": st.column_config.NumberColumn(format="%,.0f"),
-        "진입취소선": st.column_config.NumberColumn(format="%,.0f"),
         "RSI14": st.column_config.NumberColumn(format="%.1f"),
-        "시장대비20일(%p)": st.column_config.NumberColumn(format="%+.2f"),
+        "지수대비20일(%p)": st.column_config.NumberColumn(format="%+.2f"),
     },
 )
+st.caption(
+    "정렬: 진입점수 내림차순 · 현재가·등락률은 실시간, 단계 판정은 시장별 확정 "
+    "종가 기준 · 상대강도는 한국 KOSPI·KOSDAQ / 미국 S&P500 · 미국은 수급·공매도 "
+    "미제공으로 진입점수에서 중립 처리"
+)
 
-options = list(analyses)
-selected_code = st.selectbox(
+options = [uid for uid in uids if uid in analyses]
+selected_uid = st.selectbox(
     "상세 분석 종목",
     options,
-    format_func=lambda code: f"{analyses[code]['basic']['name']} ({code})",
+    format_func=lambda uid: (
+        f"{('🇰🇷' if split_uid(uid)[0] == MARKET_KR else '🇺🇸')} "
+        f"{analyses[uid]['basic']['name']} ({split_uid(uid)[1]})"
+    ),
 )
-selected = analyses[selected_code]
+selected = analyses[selected_uid]
+sel_market, sel_symbol = split_uid(selected_uid)
+sel_meta = MARKET_META[sel_market]
 basic = selected["basic"]
 history = selected["history"]
 entry = selected["entry"]
 flow = selected["flow"]
 short_pressure = selected["short_pressure"]
+sel_flag = "🇰🇷" if sel_market == MARKET_KR else "🇺🇸"
 
 st.divider()
 st.subheader(
-    f"{STAGE_ICON[selected['stage']]} {basic['name']} ({selected_code}) · "
-    f"{selected['stage']}"
-    f" · {entry['status']}"
+    f"{sel_flag} {STAGE_ICON[selected['stage']]} {basic['name']} "
+    f"({sel_symbol}) · {selected['stage']} · {entry['status']}"
 )
+
+close_label = sel_meta["close_time"].strftime("%H:%M")
+if selected["final_quote"]:
+    anchor_note = f"판정 기준: 확정 종가 (당일 마감 반영)"
+elif selected["partial_dropped"]:
+    anchor_note = (
+        f"판정 기준: 확정 종가 · 장중 당일 캔들 제외, 현지 {close_label} 이후 반영"
+    )
+else:
+    anchor_note = "판정 기준: 확정 종가 (직전 거래일)"
+st.caption(anchor_note)
 
 m1, m2, m3, m4, m5, m6 = st.columns(6)
 m1.metric(
     "현재가",
-    f"{basic['price']:,.0f}" if basic["price"] is not None else "—",
+    _money(basic["price"], sel_market),
     f"{basic['change_pct']:+.2f}%" if basic["change_pct"] is not None else None,
 )
 m2.metric("추세 단계", selected["stage"])
 m3.metric("진입점수", f"{entry['score']}/100")
-m4.metric("수급 줄다리기", flow["label"])
-m5.metric("공매도 압력", short_pressure["label"])
+m4.metric("수급 줄다리기", flow["label"] if sel_meta["has_investor_flow"] else "해당없음")
+m5.metric("공매도 압력", short_pressure["label"] if sel_meta["has_short_selling"] else "해당없음")
 m6.metric(
     f"{selected['benchmark_name']} 대비 20일",
     f"{selected['rs20']:+.2f}%p" if pd.notna(selected["rs20"]) else "—",
 )
+if selected.get("live_stage"):
+    st.info(
+        f"장중 잠정(당일 캔들 포함 시): {STAGE_ICON[selected['live_stage']]} "
+        f"{selected['live_stage']} — 현지 {close_label} 확정 후 반영됩니다."
+    )
 
 entry_message = f"{entry['status']} — {entry['reason']}"
 if entry["status"].startswith("🟢"):
@@ -1405,17 +1836,15 @@ else:
 
 st.markdown("### 매수 타이밍·가격")
 p1, p2, p3, p4, p5 = st.columns(5)
-p1.metric(
-    "분석 기준 종가",
-    f"{history['close'].iloc[-1]:,.0f}원",
-)
+p1.metric("분석 기준 종가", _money(history["close"].iloc[-1], sel_market))
 p2.metric(
     "눌림목 검토구간",
-    f"{entry['pullback_low']:,.0f}~{entry['pullback_high']:,.0f}원",
+    f"{_money(entry['pullback_low'], sel_market)}~"
+    f"{_money(entry['pullback_high'], sel_market)}",
 )
-p3.metric("돌파 확인가격", f"{entry['breakout_trigger']:,.0f}원")
-p4.metric("눌림 진입취소선", f"{entry['entry_cancel']:,.0f}원")
-p5.metric("MA20 추세선", f"{entry['trend_invalidation']:,.0f}원")
+p3.metric("돌파 확인가격", _money(entry["breakout_trigger"], sel_market))
+p4.metric("눌림 진입취소선", _money(entry["entry_cancel"], sel_market))
+p5.metric("MA20 추세선", _money(entry["trend_invalidation"], sel_market))
 
 st.markdown(f"**매수 확인 조건:** {entry['buy_condition']}")
 st.markdown(f"**취소·재판정 조건:** {entry['cancel_condition']}")
@@ -1439,13 +1868,21 @@ st.dataframe(
     pd.DataFrame([component_row], index=["진입점수 구성"]),
     width="stretch",
 )
+if sel_market == MARKET_US:
+    st.caption(
+        "미국 종목은 외국인·기관 수급과 공매도 데이터가 없어 두 항목이 중립값"
+        "(각 10·8점)으로 들어갑니다. 진입점수는 추세·가격·거래량 중심으로 보세요."
+    )
 
 st.info(selected["action"])
 if selected["overheat"]:
     st.warning("과열·추격주의: " + " / ".join(selected["overheat"]))
 
-st.markdown("### 외국인·기관 매수/매도 줄다리기")
-if flow["available"]:
+if not sel_meta["has_investor_flow"]:
+    st.markdown("### 외국인·기관 매수/매도 줄다리기")
+    st.info("미국 종목은 외국인·기관 수급 구분 데이터가 없어 표시하지 않습니다.")
+elif flow["available"]:
+    st.markdown("### 외국인·기관 매수/매도 줄다리기")
     flow_table = pd.DataFrame([
         {
             "주체": "외국인",
@@ -1493,8 +1930,14 @@ if flow["available"]:
 else:
     st.info("투자자별 수급 응답이 없어 가격·거래량만으로 진입점수를 계산했습니다.")
 
-st.markdown("### KRX 공매도 압력")
-if short_pressure["available"]:
+if not sel_meta["has_short_selling"]:
+    st.markdown("### 공매도 압력")
+    st.info(
+        "미국은 일별 공매도 데이터가 없습니다(FINRA 월 2회 지연 공시). "
+        "공매도 항목은 진입점수에서 중립으로 처리됩니다."
+    )
+elif short_pressure["available"]:
+    st.markdown("### KRX 공매도 압력")
     s1, s2, s3, s4, s5 = st.columns(5)
     s1.metric("판정", short_pressure["label"])
     s2.metric(
@@ -1553,14 +1996,21 @@ if short_pressure["available"]:
 
     trade_date = short_pressure["latest_trade_date"]
     balance_date = short_pressure["latest_balance_date"]
+    stale_note = (
+        " · ⚠️ 거래일과 잔고 공시일 간극이 커 잔고 변화 가중을 절반으로 낮췄습니다"
+        if short_pressure.get("balance_stale")
+        else ""
+    )
     st.caption(
         "공매도 거래 최근일 "
         f"{trade_date.strftime('%Y-%m-%d') if trade_date is not None else '—'} · "
         "잔고 공시 최근일 "
         f"{balance_date.strftime('%Y-%m-%d') if balance_date is not None else '—'} · "
         "KRX+NXT 전체 당일 거래는 통상 18:10 이후, 공매도 잔고는 T+2 지연 반영"
+        + stale_note
     )
 else:
+    st.markdown("### KRX 공매도 압력")
     st.info("KRX 공매도 통계 응답이 없어 공매도 항목은 중립값으로 계산했습니다.")
 
 st.markdown("### 바닥·추세 세부 신호")
@@ -1606,18 +2056,25 @@ with c2:
     rsi_chart = history[["rsi14"]].tail(100).rename(columns={"rsi14": "RSI14"})
     st.line_chart(rsi_chart, height=220)
 
-krx = fetch_krx_confirmation(krx_auth_key, selected_code, basic["sosok"])
-if krx.get("status") == "정상":
-    st.success(
-        f"KRX 공식 확정치 대조 정상 · {krx['date']} 종가 "
-        f"{krx['close']:,.0f}원 / 등락률 {krx['change_pct']:+.2f}%"
-    )
+if sel_meta["has_krx_confirm"]:
+    krx = fetch_krx_confirmation(krx_auth_key, sel_symbol, basic.get("sosok", ""))
+    if krx.get("status") == "정상":
+        st.success(
+            f"KRX 공식 확정치 대조 정상 · {krx['date']} 종가 "
+            f"{krx['close']:,.0f}원 / 등락률 {krx['change_pct']:+.2f}%"
+        )
+    else:
+        st.caption(f"KRX 공식 확정치: {krx.get('status', '확인불가')}")
 else:
-    st.caption(f"KRX 공식 확정치: {krx.get('status', '확인불가')}")
+    st.caption("미국 종목: 야후 파이낸스 수정주가 기준 (KRX 대조 없음)")
 
+source_note = (
+    "네이버 장중/일봉·투자자 수급, KRX 공매도 통계와 확정 일별 통계를 대조·가공"
+    if sel_market == MARKET_KR
+    else "야후 파이낸스 v8 chart(수정주가)를 가공"
+)
 st.caption(
-    f"장중 기준시각: {basic['traded_at'] or '확인불가'} · "
-    "네이버 장중/일봉·투자자 수급, KRX 공매도 통계와 확정 일별 통계를 대조·가공했습니다."
+    f"장중 기준시각: {basic['traded_at'] or '확인불가'} · {source_note}했습니다."
 )
 st.caption(
     "⚠️ 표시 가격은 확정 수익을 보장하는 목표가가 아니라 조건부 관찰선입니다. "
