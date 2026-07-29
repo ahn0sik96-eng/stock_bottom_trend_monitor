@@ -1,7 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-개별종목 바닥확인 → 상승추세·매수구간 모니터 v3.4
+개별종목 바닥확인 → 상승추세·매수구간 분석기 v3.5
 ========================================
+2026-07-30 단일 종목·공매도 CSV 분석. v3.4 → v3.5 주요 변경:
+
+  [변경 · 종목 한 개씩 분석]
+  A. 최대 20개 감시목록과 전체 감시판을 제거하고 검색에서 선택한 종목
+     한 개만 수집·분석·표시한다.
+  B. 선물 CSV와 KRX 개별종목 공매도 종합정보 CSV를 현재 종목에 바로
+     적용하며 여러 기간 파일은 일자를 기준으로 자동 병합한다.
+  C. 공매도 자동수집은 사용하지 않고 CSV가 없으면 중립, 업로드하면
+     공매도 거래량·거래대금·업틱룰·순보유잔고를 분석한다.
+
 2026-07-30 KRX 공매도 Streamlit 403 우회. v3.3 → v3.4 주요 변경:
 
   [수정 · 공매도 ISIN 조회 403 제거]
@@ -106,7 +116,7 @@ except Exception:
 # 0. 설정
 # ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="개별종목 바닥·상승추세 모니터",
+    page_title="개별종목 바닥·상승추세 분석기",
     page_icon="📈",
     layout="wide",
 )
@@ -856,14 +866,20 @@ def _csv_structure_score(frame: pd.DataFrame) -> int:
             score += 3
         if "종목명" in column or "기초자산명" in column:
             score += 2
+        if "공매도" in column:
+            score += 5
+        if "업틱룰" in column:
+            score += 3
+        if "잔고" in column:
+            score += 5
         if column.startswith("unnamed"):
             score -= 1
     return score
 
 
-def _read_uploaded_csv(uploaded_file):
-    """KRX의 인코딩·구분자·제목행·2단 헤더 차이를 자동 탐색한다."""
-    raw = uploaded_file.getvalue()
+@st.cache_data(ttl=3600, show_spinner=False)
+def _read_uploaded_csv_bytes(raw: bytes):
+    """KRX의 인코딩·구분자·제목행·다단 헤더 차이를 자동 탐색한다."""
     if not raw:
         raise ValueError("빈 파일입니다")
     head = raw[:4096].lower()
@@ -875,41 +891,233 @@ def _read_uploaded_csv(uploaded_file):
 
     best_frame, best_score, last_error = None, -1000, None
     encodings = ("utf-8-sig", "cp949", "euc-kr", "utf-8")
-    separators = (",", "\t", ";", "|", None)
+    selected_encoding = ""
     for encoding in encodings:
         try:
-            raw.decode(encoding)
+            preview = raw[:8192].decode(encoding)
+            selected_encoding = encoding
+            break
         except UnicodeDecodeError as exc:
             last_error = exc
-            continue
-        for separator in separators:
-            for header in range(0, 7):
-                header_options = (header, [header, header + 1])
-                for header_option in header_options:
-                    try:
-                        candidate = pd.read_csv(
-                            BytesIO(raw),
-                            encoding=encoding,
-                            sep=separator,
-                            engine="python",
-                            header=header_option,
-                            on_bad_lines="skip",
-                        )
-                        candidate.columns = _flatten_csv_columns(
-                            candidate.columns
-                        )
-                        candidate = candidate.dropna(how="all")
-                        score = _csv_structure_score(candidate)
-                        if score > best_score:
-                            best_frame, best_score = candidate, score
-                    except Exception as exc:
-                        last_error = exc
+    if not selected_encoding:
+        raise ValueError(f"CSV 문자 인코딩을 읽지 못했습니다: {last_error}")
+
+    counts = {
+        separator: preview.count(separator)
+        for separator in (",", "\t", ";", "|")
+    }
+    separators = [
+        separator
+        for separator, count in sorted(
+            counts.items(), key=lambda item: item[1], reverse=True
+        )
+        if count > 0
+    ][:2] or [","]
+    for separator in separators:
+        for header in range(0, 7):
+            header_options = (
+                header,
+                [header, header + 1],
+                [header, header + 1, header + 2],
+            )
+            for header_option in header_options:
+                try:
+                    candidate = pd.read_csv(
+                        BytesIO(raw),
+                        encoding=selected_encoding,
+                        sep=separator,
+                        header=header_option,
+                        on_bad_lines="skip",
+                    )
+                    candidate.columns = _flatten_csv_columns(
+                        candidate.columns
+                    )
+                    candidate = candidate.dropna(how="all")
+                    score = _csv_structure_score(candidate)
+                    if score > best_score:
+                        best_frame, best_score = candidate, score
+                except Exception as exc:
+                    last_error = exc
     if best_frame is not None and best_score >= 8:
         return best_frame
     raise ValueError(
         "CSV 열 구조를 판별하지 못했습니다"
         + (f": {last_error}" if last_error else "")
     )
+
+
+def _read_uploaded_csv(uploaded_file):
+    return _read_uploaded_csv_bytes(uploaded_file.getvalue()).copy()
+
+
+def _standardize_short_selling_frame(frame: pd.DataFrame):
+    """KRX 공매도 종합정보 CSV를 자동수집 자료와 같은 열로 변환한다."""
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    frame = frame.copy()
+    frame.columns = [str(column).strip() for column in frame.columns]
+    columns = list(frame.columns)
+
+    date_col = _find_column(
+        columns,
+        lambda c: c in {
+            "일자", "날짜", "기준일", "거래일", "거래일자",
+            "date", "trddd", "basdd",
+        } or c.endswith("일자"),
+    )
+    if date_col is None:
+        raise ValueError("일자 열을 찾지 못했습니다")
+
+    short_volume_col = _find_column(
+        columns,
+        lambda c: (
+            c in {
+                "공매도거래량", "공매도수량", "전체공매도거래량",
+                "shortvolume", "shortsellingvolume", "cvssrtelltrdvol",
+                "cvssrtselltrdvol",
+            }
+            or (
+                "공매도" in c
+                and ("거래량" in c or "거래수량" in c)
+                and "잔고" not in c
+                and "업틱" not in c
+            )
+            or (
+                "공매도수량" in c
+                and "잔고" not in c
+                and "업틱" not in c
+            )
+        ),
+    )
+    uptick_col = _find_column(
+        columns,
+        lambda c: (
+            c in {"업틱룰적용", "업틱룰적용거래량", "uptickvolume"}
+            or (
+                "업틱룰적용" in c
+                and ("거래량" in c or "수량" in c)
+            )
+        ),
+    )
+    exception_col = _find_column(
+        columns,
+        lambda c: (
+            c in {"업틱룰예외", "업틱룰예외거래량", "exceptionvolume"}
+            or (
+                "업틱룰예외" in c
+                and ("거래량" in c or "수량" in c)
+            )
+        ),
+    )
+    balance_col = _find_column(
+        columns,
+        lambda c: (
+            c in {
+                "공매도잔고수량", "순보유잔고수량", "잔고수량",
+                "shortbalance", "shortbalanceqty", "strconstval1",
+            }
+            or (
+                "잔고" in c
+                and ("수량" in c or "순보유" in c)
+                and "금액" not in c
+            )
+        ),
+    )
+    short_value_col = _find_column(
+        columns,
+        lambda c: (
+            c in {
+                "공매도거래대금", "공매도금액", "shortvalue",
+                "shortsellingvalue", "cvssrtselltrdval",
+            }
+            or (
+                "공매도" in c
+                and ("거래대금" in c or "거래금액" in c)
+                and "잔고" not in c
+                and "업틱" not in c
+            )
+        ),
+    )
+    balance_value_col = _find_column(
+        columns,
+        lambda c: (
+            c in {
+                "공매도잔고금액", "순보유잔고금액", "잔고금액",
+                "balancevalue", "shortbalancevalue", "strconstval2",
+            }
+            or ("잔고" in c and "금액" in c)
+        ),
+    )
+    if short_volume_col is None and balance_col is None:
+        raise ValueError(
+            "공매도 거래량 또는 순보유잔고 수량 열을 찾지 못했습니다"
+        )
+
+    dates = _date_series(frame[date_col])
+    standardized = pd.DataFrame(index=dates)
+    standardized.index.name = "date"
+    mappings = {
+        "short_volume": short_volume_col,
+        "uptick_volume": uptick_col,
+        "exception_volume": exception_col,
+        "short_balance": balance_col,
+        "short_value": short_value_col,
+        "balance_value": balance_value_col,
+    }
+    for output_column, source_column in mappings.items():
+        standardized[output_column] = (
+            _numeric_series(frame[source_column]).to_numpy()
+            if source_column is not None
+            else np.nan
+        )
+    standardized = (
+        standardized[~standardized.index.isna()]
+        .groupby(level=0)
+        .last()
+        .sort_index()
+    )
+    return standardized
+
+
+def parse_short_selling_uploads(uploaded_files, target_uids):
+    """사용자가 지정한 종목별로 KRX 공매도 CSV를 병합한다."""
+    datasets, errors = {}, []
+    for index, uploaded in enumerate(uploaded_files or []):
+        target_uid = (
+            target_uids[index]
+            if index < len(target_uids or [])
+            else ""
+        )
+        if not target_uid:
+            errors.append(f"{uploaded.name}: 적용할 종목을 선택하세요")
+            continue
+        try:
+            raw = _read_uploaded_csv(uploaded)
+            standardized = _standardize_short_selling_frame(raw)
+            if standardized.empty:
+                raise ValueError("공매도 일별 자료가 없습니다")
+            current = datasets.get(target_uid)
+            if current is None:
+                merged = standardized
+                filenames = [uploaded.name]
+            else:
+                # 뒤에 올린 파일이 같은 날짜의 값을 갱신한다.
+                merged = standardized.combine_first(current["frame"]).sort_index()
+                filenames = list(dict.fromkeys(
+                    current["filenames"] + [uploaded.name]
+                ))
+            datasets[target_uid] = {
+                "frame": merged,
+                "filenames": filenames,
+                "source": (
+                    f"업로드 KRX 공매도 CSV {len(filenames)}개 병합"
+                    if len(filenames) > 1
+                    else "업로드 KRX 공매도 CSV"
+                ),
+            }
+        except Exception as exc:
+            errors.append(f"{uploaded.name}: {exc}")
+    return datasets, errors
 
 
 def parse_stock_futures_uploads(uploaded_files):
@@ -1955,6 +2163,7 @@ def fetch_bundle(
     krx_id: str = "",
     krx_pw: str = "",
     auth_key: str = "",
+    skip_short: bool = False,
 ):
     """한 종목의 기본정보·일봉·(한국)수급·공매도를 시장별로 묶는다."""
     market, symbol = split_uid(uid)
@@ -1974,25 +2183,32 @@ def fetch_bundle(
         basic = _fallback_basic(market, symbol, label)
     with ThreadPoolExecutor(max_workers=2) as pool:
         investor_future = pool.submit(fetch_investor_trend, symbol)
-        short_future = pool.submit(
-            fetch_short_selling,
-            symbol,
-            70,
-            krx_id,
-            krx_pw,
-            auth_key,
-            basic.get("sosok", ""),
+        short_future = (
+            None
+            if skip_short
+            else pool.submit(
+                fetch_short_selling,
+                symbol,
+                70,
+                krx_id,
+                krx_pw,
+                auth_key,
+                basic.get("sosok", ""),
+            )
         )
         try:
             investor = investor_future.result()
         except Exception:
             investor = empty_flow
-        try:
-            short_selling = short_future.result()
-        except Exception as exc:
-            short_selling = _empty_short_frame(
-                f"공매도 수집 예외: {type(exc).__name__}: {exc}"
-            )
+        if short_future is None:
+            short_selling = _empty_short_frame("공매도 CSV 미업로드")
+        else:
+            try:
+                short_selling = short_future.result()
+            except Exception as exc:
+                short_selling = _empty_short_frame(
+                    f"공매도 수집 예외: {type(exc).__name__}: {exc}"
+                )
     return basic, history, investor, short_selling
 
 
@@ -3863,9 +4079,10 @@ def evaluate_stock(
 # ──────────────────────────────────────────────────────────────
 # 3. 화면
 # ──────────────────────────────────────────────────────────────
-st.title("📈 개별종목 상승추세·매수구간 모니터")
+st.title("📈 개별종목 상승추세·매수구간 분석기")
 st.caption(
-    "한국·미국 개별종목의 바닥·상승추세, 눌림목·돌파 가격, 추격 위험을 판정합니다. "
+    "검색에서 선택한 종목 한 개의 바닥·상승추세, 눌림목·돌파 가격, "
+    "추격 위험을 판정합니다. "
     "한국은 현물수급과 개별주식선물의 수급·베이시스·거래량·미결제약정, "
     "지수선물·공매도·기술지표를 교차 분석하고, 미국은 가격·거래량·상대강도 "
     "기반으로 자동 판정합니다."
@@ -3879,20 +4096,31 @@ krx_auth_key = _secret("KRX_AUTH_KEY")
 krx_login_id = _secret("KRX_ID")
 krx_login_pw = _secret("KRX_PW")
 
-query_watchlist = parse_watchlist(st.query_params.get("stocks", ""))
-if "watchlist_uids" not in st.session_state:
-    st.session_state["watchlist_uids"] = (
-        query_watchlist or parse_watchlist(default_watchlist)
+query_candidates = parse_watchlist(
+    st.query_params.get("stock", "")
+    or st.query_params.get("stocks", "")
+)
+default_candidates = parse_watchlist(default_watchlist)
+if "active_uid" not in st.session_state:
+    legacy_watchlist = st.session_state.get("watchlist_uids", [])
+    st.session_state["active_uid"] = (
+        query_candidates[0]
+        if query_candidates
+        else legacy_watchlist[0]
+        if legacy_watchlist
+        else default_candidates[0]
+        if default_candidates
+        else "KR:005930"
     )
 if "stock_labels" not in st.session_state:
     st.session_state["stock_labels"] = {}
 
 
-def sync_watchlist_url():
-    current = st.session_state["watchlist_uids"]
-    if current:
-        st.query_params["stocks"] = ",".join(current)
-    elif "stocks" in st.query_params:
+def sync_active_stock_url():
+    active = st.session_state.get("active_uid", "")
+    if active:
+        st.query_params["stock"] = active
+    if "stocks" in st.query_params:
         del st.query_params["stocks"]
 
 
@@ -3903,8 +4131,15 @@ def uid_display(uid: str):
     return f"{flag} {label} ({symbol})" if label else f"{flag} {symbol}"
 
 
+active_uid = st.session_state["active_uid"]
+active_market, active_symbol = split_uid(active_uid)
+futures_flow_uploads = []
+short_selling_uploads = []
+short_upload_targets = []
+
+
 with st.sidebar:
-    st.header("🔎 종목 검색")
+    st.header("🔎 분석 종목 선택")
     market_choice = st.radio(
         "시장",
         [MARKET_KR, MARKET_US],
@@ -3938,92 +4173,99 @@ with st.sidebar:
                 f"{result_map[s]['name']} ({s}) · {result_map[s]['exchange']}"
             ),
         )
-        if st.button("➕ 감시목록에 추가", type="primary"):
+        if st.button("이 종목 분석", type="primary"):
             picked = result_map[picked_symbol]
             uid = make_uid(picked["market"], picked["symbol"])
-            current = st.session_state["watchlist_uids"]
-            if uid in current:
-                st.info("이미 감시 중인 종목입니다.")
-            elif len(current) >= 20:
-                st.warning("감시종목은 최대 20개입니다.")
-            else:
-                current.append(uid)
-                st.session_state["stock_labels"][uid] = picked["name"]
-                sync_watchlist_url()
-                st.rerun()
+            st.session_state["active_uid"] = uid
+            st.session_state["stock_labels"][uid] = picked["name"]
+            sync_active_stock_url()
+            st.rerun()
     elif search_query.strip():
         label = "KOSPI·KOSDAQ" if market_choice == MARKET_KR else "미국 상장"
         st.info(f"{label} 종목 검색 결과가 없습니다.")
 
     st.divider()
-    st.subheader("현재 감시목록")
-    current_uids = st.session_state["watchlist_uids"]
-    if current_uids:
-        remove_uids = st.multiselect(
-            "삭제할 종목 선택", current_uids, format_func=uid_display
-        )
-        if st.button("🗑️ 선택 종목 삭제", disabled=not remove_uids):
-            st.session_state["watchlist_uids"] = [
-                u for u in current_uids if u not in remove_uids
-            ]
-            sync_watchlist_url()
-            st.rerun()
-        kr_n = sum(1 for u in current_uids if split_uid(u)[0] == MARKET_KR)
-        us_n = len(current_uids) - kr_n
-        st.caption(f"{len(current_uids)}개 (🇰🇷{kr_n} · 🇺🇸{us_n}) / 최대 20개")
-    else:
-        st.info("검색 후 종목을 추가하세요.")
+    st.subheader("현재 분석 종목")
+    st.info(uid_display(active_uid))
 
     st.divider()
-    if krx_auth_key:
-        st.success("KRX Open API 키 설정됨 · 종가·주식선물 자동조회")
-    else:
-        st.info(
-            "KRX Open API 키 미설정 · 주식선물 가격·거래량·OI 자동조회 불가"
-        )
-    if krx_login_id and krx_login_pw:
-        st.success("KRX Data Marketplace 로그인 설정됨 · 공매도 자동조회")
-    else:
+    if active_market == MARKET_KR:
+        if krx_auth_key:
+            st.success("KRX Open API 키 설정됨 · 종가·주식선물 자동조회")
+        else:
+            st.info(
+                "KRX Open API 키 미설정 · 주식선물 가격·거래량·OI 자동조회 불가"
+            )
         st.caption(
-            "공매도는 익명 자동조회를 먼저 시도합니다. KRX_ID·KRX_PW는 "
-            "KRX 자체 계정에만 해당하며 네이버 간편로그인 비밀번호는 "
-            "입력하면 안 됩니다."
+            "선물·공매도 CSV를 올리면 현재 분석 종목에 바로 적용합니다."
         )
 
-    st.subheader("📄 개별주식선물 종합자료")
-    futures_flow_uploads = st.file_uploader(
-        "KRX·HTS CSV(여러 파일 자동 병합)",
-        type=["csv"],
-        accept_multiple_files=True,
-        help=(
-            "투자자별 일별 수급 CSV와 선물 일별 시세 CSV를 함께 올릴 수 "
-            "있습니다. 종목코드·기초자산명과 일자를 기준으로 자동 병합합니다."
-        ),
-    )
-    futures_template = pd.DataFrame({
-        "종목코드": ["005930", "005930"],
-        "기초자산명": ["삼성전자", "삼성전자"],
-        "일자": ["2026-07-28", "2026-07-29"],
-        "외국인순매수": [1200, -350],
-        "기관순매수": [-400, 600],
-        "현물종가": [150000, 151200],
-        "선물종가": [150200, 151000],
-        "이론가": [150180, 151040],
-        "선물거래량": [28600, 33100],
-        "미결제약정": [105000, 106500],
-        "만기일": ["2026-09-10", "2026-09-10"],
-    }).to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        "CSV 양식 받기",
-        futures_template,
-        file_name="stock_futures_flow_template.csv",
-        mime="text/csv",
-    )
-    st.caption(
-        "KRX 조회구분은 반드시 '일별추이'로 선택하세요. 수급 CSV만으로도 "
-        "분석되지만, 선물종가·거래량·미결제약정·만기일을 함께 올려야 "
-        "베이시스와 포지션 변화를 종합 판정할 수 있습니다."
-    )
+        st.subheader("📄 개별주식선물 자료")
+        futures_flow_uploads = st.file_uploader(
+            "선물 CSV(여러 파일 병합)",
+            type=["csv"],
+            accept_multiple_files=True,
+            help=(
+                "현재 종목의 투자자별 수급·선물시세 CSV를 함께 올릴 수 "
+                "있습니다. 일자를 기준으로 자동 병합합니다."
+            ),
+            key=f"futures_csv_{active_uid}",
+        )
+        futures_template = pd.DataFrame({
+            "종목코드": [active_symbol, active_symbol],
+            "일자": ["2026-07-28", "2026-07-29"],
+            "외국인순매수": [1200, -350],
+            "기관순매수": [-400, 600],
+            "현물종가": [150000, 151200],
+            "선물종가": [150200, 151000],
+            "선물거래량": [28600, 33100],
+            "미결제약정": [105000, 106500],
+            "만기일": ["2026-09-10", "2026-09-10"],
+        }).to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "선물 CSV 양식",
+            futures_template,
+            file_name=f"{active_symbol}_stock_futures_template.csv",
+            mime="text/csv",
+        )
+        st.caption(
+            "KRX 조회구분은 '일별추이'로 내려받으세요. 업로드 자료는 현재 "
+            "분석 종목에 적용됩니다."
+        )
+
+        st.subheader("📄 KRX 공매도 자료")
+        short_selling_uploads = st.file_uploader(
+            "공매도 종합정보 CSV(여러 파일 병합)",
+            type=["csv"],
+            accept_multiple_files=True,
+            help=(
+                "KRX 개별종목 공매도 종합정보에서 내려받은 CSV를 올리세요. "
+                "공매도 거래량과 순보유잔고를 일자별로 병합합니다."
+            ),
+            key=f"short_csv_{active_uid}",
+        )
+        short_upload_targets = [active_uid] * len(short_selling_uploads)
+        short_template = pd.DataFrame({
+            "일자": ["2026-07-28", "2026-07-29"],
+            "공매도 거래량": [125000, 142000],
+            "업틱룰 적용 거래량": [120000, 137000],
+            "업틱룰 예외 거래량": [5000, 5000],
+            "순보유잔고 수량": [3200000, 3150000],
+            "공매도 거래대금": [18750000000, 21400000000],
+            "순보유잔고 금액": [480000000000, 476000000000],
+        }).to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "공매도 CSV 양식",
+            short_template,
+            file_name=f"{active_symbol}_short_selling_template.csv",
+            mime="text/csv",
+        )
+        st.caption(
+            "KRX 정보데이터시스템 → 공매도 → 개별종목 공매도 종합정보 → "
+            "기간 조회 → CSV 다운로드 순서입니다. 업로드 자료가 자동조회보다 "
+            "우선합니다."
+        )
+
     if st.button("🔄 데이터 새로고침"):
         st.cache_data.clear()
         st.rerun()
@@ -4040,10 +4282,7 @@ if kr_open or us_open:
     except Exception:
         pass
 
-uids = list(st.session_state["watchlist_uids"])
-if not uids:
-    st.info("왼쪽 검색창에서 감시할 종목을 추가하세요.")
-    st.stop()
+uids = [active_uid]
 
 futures_upload_datasets, futures_upload_errors = (
     parse_stock_futures_uploads(futures_flow_uploads)
@@ -4052,6 +4291,16 @@ if futures_upload_errors:
     st.warning(
         "개별주식선물 CSV 일부를 읽지 못했습니다: "
         + " / ".join(futures_upload_errors)
+    )
+short_upload_datasets, short_upload_errors = (
+    parse_short_selling_uploads(
+        short_selling_uploads, short_upload_targets
+    )
+)
+if short_upload_errors:
+    st.warning(
+        "공매도 CSV 일부를 읽지 못했습니다: "
+        + " / ".join(short_upload_errors)
     )
 kr_stock_count = sum(
     1 for uid in uids if split_uid(uid)[0] == MARKET_KR
@@ -4071,6 +4320,12 @@ elif kr_stock_count and not futures_auto_access:
     st.caption(
         f"KRX 개별주식선물 투자자 통계 자동조회 제한({futures_auto_status}) · "
         "필요한 종목의 KRX·HTS CSV를 업로드하면 분석됩니다."
+    )
+if short_upload_datasets:
+    uploaded_short = short_upload_datasets.get(active_uid, {})
+    st.caption(
+        f"공매도 CSV {len(uploaded_short.get('filenames', []))}개를 "
+        "현재 종목에 우선 반영합니다."
     )
 
 # 시장별 벤치마크는 한 번씩만 수집. 한국은 sosok을 아직 모르므로 둘 다,
@@ -4107,7 +4362,7 @@ if MARKET_KR in markets_present:
 empty_benchmark = pd.DataFrame(columns=["close"])
 labels = st.session_state["stock_labels"]
 analyses, failures = {}, {}
-with st.spinner(f"{len(uids)}개 종목 자동 분석..."):
+with st.spinner("선택 종목 분석 중..."):
     with ThreadPoolExecutor(max_workers=min(8, len(uids))) as pool:
         future_map = {
             pool.submit(
@@ -4117,6 +4372,7 @@ with st.spinner(f"{len(uids)}개 종목 자동 분석..."):
                 krx_login_id,
                 krx_login_pw,
                 krx_auth_key,
+                split_uid(uid)[0] == MARKET_KR,
             ): uid
             for uid in uids
         }
@@ -4125,6 +4381,16 @@ with st.spinner(f"{len(uids)}개 종목 자동 분석..."):
             market, symbol = split_uid(uid)
             try:
                 basic, history, investor, short_selling = future.result()
+                uploaded_short = short_upload_datasets.get(uid)
+                if uploaded_short is not None:
+                    short_selling = uploaded_short["frame"].copy()
+                    short_selling.attrs.update({
+                        "status": "업로드 정상",
+                        "source": uploaded_short["source"],
+                        "filenames": ", ".join(
+                            uploaded_short["filenames"]
+                        ),
+                    })
                 stock_futures = pd.DataFrame()
                 stock_futures_meta = {
                     "status": "해당 없음",
@@ -4266,86 +4532,13 @@ if not analyses:
     st.error("분석 가능한 종목이 없습니다.")
     st.stop()
 
-summary_rows = []
-for uid, result in analyses.items():
-    market, symbol = split_uid(uid)
-    basic = result["basic"]
-    entry = result["entry"]
-    flow = result["flow"]
-    futures_flow = result["futures_flow"]
-    short_pressure = result["short_pressure"]
-    if basic["name"] != symbol:
-        st.session_state["stock_labels"][uid] = basic["name"]
-    flag = "🇰🇷" if market == MARKET_KR else "🇺🇸"
-    live_stage = result.get("live_stage")
-    pl = entry["pullback_low"]
-    ph = entry["pullback_high"]
-    summary_rows.append({
-        "우선순위": STAGE_RANK[result["stage"]],
-        "_score": entry["score"],
-        "시장": flag,
-        "종목": basic["name"],
-        "심볼": symbol,
-        "단계": f"{STAGE_ICON[result['stage']]} {result['stage']}",
-        "장중잠정": (f"{STAGE_ICON[live_stage]} {live_stage}" if live_stage else ""),
-        "매수판정": entry["status"],
-        "진입점수": entry["score"],
-        "현재가": basic["price"],
-        "등락률(%)": basic["change_pct"],
-        "눌림목 가격": f"{_money(pl, market)}~{_money(ph, market)}",
-        "돌파가격": _money(entry["breakout_trigger"], market),
-        "진입취소선": _money(entry["entry_cancel"], market),
-        "현물 외·기 수급": flow["label"],
-        "선물 외·기 수급": (
-            futures_flow["integrated_label"]
-            if futures_flow["available"]
-            else "데이터 없음" if market == MARKET_KR
-            else "해당없음"
-        ),
-        "공매도": short_pressure["label"],
-        "RSI14": result["rsi"],
-        "지수대비20일(%p)": result["rs20"],
-    })
-
-summary = (
-    pd.DataFrame(summary_rows)
-    .sort_values(["_score", "우선순위"], ascending=[False, True])
-    .drop(columns=["우선순위", "_score"])
-)
-if (summary["장중잠정"] == "").all():
-    summary = summary.drop(columns=["장중잠정"])
-
-st.subheader("전체 감시판 · 매수 타이밍 우선")
-st.dataframe(
-    summary,
-    width="stretch",
-    hide_index=True,
-    column_config={
-        "현재가": st.column_config.NumberColumn(format="localized"),
-        "등락률(%)": st.column_config.NumberColumn(format="%+.2f"),
-        "진입점수": st.column_config.ProgressColumn(
-            min_value=0, max_value=100, format="%d",
-        ),
-        "RSI14": st.column_config.NumberColumn(format="%.1f"),
-        "지수대비20일(%p)": st.column_config.NumberColumn(format="%+.2f"),
-    },
-)
-st.caption(
-    "정렬: 진입점수 내림차순 · 현재가·등락률은 실시간, 단계 판정은 시장별 확정 "
-    "종가 기준 · 상대강도는 한국 KOSPI·KOSDAQ / 미국 S&P500 · 한국의 "
-    "개별주식선물 종합점수는 데이터가 있을 때만 10점 비중으로 반영"
-)
-
-options = [uid for uid in uids if uid in analyses]
-selected_uid = st.selectbox(
-    "상세 분석 종목",
-    options,
-    format_func=lambda uid: (
-        f"{('🇰🇷' if split_uid(uid)[0] == MARKET_KR else '🇺🇸')} "
-        f"{analyses[uid]['basic']['name']} ({split_uid(uid)[1]})"
-    ),
-)
+selected_uid = active_uid
+if selected_uid not in analyses:
+    st.error("현재 선택 종목을 분석하지 못했습니다.")
+    st.stop()
 selected = analyses[selected_uid]
+if selected["basic"]["name"] != split_uid(selected_uid)[1]:
+    st.session_state["stock_labels"][selected_uid] = selected["basic"]["name"]
 sel_market, sel_symbol = split_uid(selected_uid)
 sel_meta = MARKET_META[sel_market]
 basic = selected["basic"]
@@ -4773,10 +4966,16 @@ elif short_pressure["available"]:
 else:
     st.markdown("### KRX 공매도 압력")
     short_status = short_pressure.get("status", "응답 없음")
-    st.warning(
-        f"공매도 자동수집 실패: {short_status}. "
-        "공매도 항목은 중립값으로 계산했습니다."
-    )
+    if short_status == "공매도 CSV 미업로드":
+        st.info(
+            "공매도 CSV가 아직 업로드되지 않았습니다. 왼쪽의 KRX 공매도 "
+            "자료에 CSV를 올리기 전까지 공매도 항목은 중립값으로 계산합니다."
+        )
+    else:
+        st.warning(
+            f"공매도 CSV 처리 실패: {short_status}. "
+            "공매도 항목은 중립값으로 계산했습니다."
+        )
     if "로그인 필요" in short_status:
         st.caption(
             "KRX 자체 계정이 있을 때만 Streamlit secrets의 KRX_ID·KRX_PW를 "
@@ -4848,7 +5047,7 @@ else:
 source_note = (
     "네이버 장중/일봉·현물 투자자 수급·KOSPI200 선물 수급, "
     "KRX Open API 개별주식선물 시세·거래량·미결제약정, "
-    "KRX/HTS 개별주식선물 투자자 수급, KRX 공매도 통계와 "
+    "KRX/HTS 개별주식선물 투자자 수급, 업로드 KRX 공매도 통계와 "
     "확정 일별 통계를 대조·가공"
     if sel_market == MARKET_KR
     else "야후 파이낸스 v8 chart(수정주가)를 가공"
