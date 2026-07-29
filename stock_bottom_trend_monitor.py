@@ -1,7 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-개별종목 바닥확인 → 상승추세·매수구간 모니터 v3.3
+개별종목 바닥확인 → 상승추세·매수구간 모니터 v3.4
 ========================================
+2026-07-30 KRX 공매도 Streamlit 403 우회. v3.3 → v3.4 주요 변경:
+
+  [수정 · 공매도 ISIN 조회 403 제거]
+  A. 배포 앱에서 확인된 finder_stkisu HTTP 403을 피하도록 KRX 공식
+     주식 Open API의 ISIN을 우선 사용하고 보통주는 ISO 6166 규칙으로
+     ISIN을 자체 생성해 공매도 종합정보를 직접 요청한다.
+  B. KRX Data Marketplace 요청 헤더를 현재 pykrx 방식의 outerLoader
+     Referer로 맞추고 네이버 간편로그인 비밀번호 입력 금지를 명시한다.
+
 2026-07-30 KRX 공식 API 자동수집 수정. v3.2 → v3.3 주요 변경:
 
   [수정 · KRX 공식 파생 API와 공매도 실패 진단]
@@ -1645,11 +1654,13 @@ def _empty_short_frame(status: str, source: str = "KRX Data Marketplace"):
 def _krx_data_request_error(prefix: str, exc: Exception):
     response = getattr(exc, "response", None)
     status_code = getattr(response, "status_code", None)
-    if status_code in (401, 403):
+    if status_code == 401:
         return (
             f"{prefix}: KRX Data Marketplace 로그인/접근 권한 필요 "
-            f"(HTTP {status_code})"
+            "(HTTP 401)"
         )
+    if status_code == 403:
+        return f"{prefix}: KRX가 현재 서버 요청을 거부함 (HTTP 403)"
     detail = str(exc).strip()
     return (
         f"{prefix}: {type(exc).__name__}"
@@ -1708,8 +1719,7 @@ def _krx_data_login_cookies(krx_id: str, krx_pw: str):
 def _new_krx_data_session(krx_id: str = "", krx_pw: str = ""):
     session = requests.Session()
     loader = (
-        "https://data.krx.co.kr/comm/srt/srtLoader/"
-        "index.cmd?screenId=MDCSTAT300"
+        "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd"
     )
     try:
         session.get(loader, headers=UA, timeout=15)
@@ -1721,80 +1731,129 @@ def _new_krx_data_session(krx_id: str = "", krx_pw: str = ""):
     return session, login_status
 
 
+def _isin_check_digit(base: str):
+    """11자리 ISIN 본문에 ISO 6166/Luhn 검증 숫자를 붙일 때 쓸 값."""
+    expanded = "".join(
+        str(int(char, 36)) if char.isalpha() else char
+        for char in base.upper()
+    )
+    total = 0
+    for index, digit in enumerate(reversed(expanded)):
+        number = int(digit) * (2 if index % 2 == 0 else 1)
+        total += number // 10 + number % 10
+    return str((10 - total % 10) % 10)
+
+
+def _generated_common_stock_isin(code: str):
+    """보통주 단축코드(끝자리 0)는 KRX 주권 ISIN 규칙으로 안전하게 생성."""
+    clean = str(code or "").strip().upper()
+    if not (len(clean) == 6 and clean.isdigit() and clean.endswith("0")):
+        return ""
+    base = f"KR7{clean}00"
+    return base + _isin_check_digit(base)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def resolve_stock_isin_openapi(auth_key: str, code: str, sosok: str):
+    """공식 KRX 주식 일별 API를 우선 사용하고 보통주는 규칙 생성으로 보완."""
+    if auth_key:
+        endpoints = (
+            ["sto/stk_bydd_trd", "sto/ksq_bydd_trd"]
+            if str(sosok) == "0"
+            else ["sto/ksq_bydd_trd", "sto/stk_bydd_trd"]
+        )
+        for endpoint in endpoints:
+            for base_date in _previous_weekdays(8):
+                try:
+                    row = _krx_stock_row(
+                        _krx_rows(auth_key, endpoint, base_date), code
+                    )
+                except Exception:
+                    break
+                if not row:
+                    continue
+                isin = str(row.get("ISU_CD", "")).strip().upper()
+                if len(isin) == 12 and isin.startswith("KR"):
+                    return isin
+    return _generated_common_stock_isin(code)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_short_selling(
     code: str,
     calendar_days: int = 70,
     krx_id: str = "",
     krx_pw: str = "",
+    auth_key: str = "",
+    sosok: str = "",
 ):
     """KRX 공매도 종합정보의 일별 거래량·공시 잔고를 가져온다."""
     session, login_status = _new_krx_data_session(krx_id, krx_pw)
     headers = {
         **UA,
         "Referer": (
-            "https://data.krx.co.kr/comm/srt/srtLoader/"
-            f"index.cmd?screenId=MDCSTAT300&isuCd={code}"
+            "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd"
         ),
-        "X-Requested-With": "XMLHttpRequest",
     }
-    try:
-        finder = session.post(
-            KRX_DATA_URL,
-            data={
-                "bld": "dbms/comm/finder/finder_stkisu",
-                "mktsel": "ALL",
-                "searchText": code,
-                "typeNo": "0",
-                "locale": "ko_KR",
-            },
-            headers=headers,
-            timeout=20,
-        )
-        finder.raise_for_status()
-    except requests.RequestException as exc:
-        return _empty_short_frame(_krx_data_request_error(
-            "종목 ISIN 조회 실패", exc
-        ))
-    finder_text = finder.text.strip()
-    if (
-        finder_text.upper() == "LOGOUT"
-        or "<html" in finder_text.lower()
-        or "로그인" in finder_text[:500]
-    ):
-        return _empty_short_frame(
-            "KRX Data Marketplace 로그인 필요"
-            + (
-                f" ({login_status})"
-                if login_status != "로그인정보 미설정"
-                else ""
+    full_code = resolve_stock_isin_openapi(auth_key, code, sosok)
+    if not full_code:
+        try:
+            finder = session.post(
+                KRX_DATA_URL,
+                data={
+                    "bld": "dbms/comm/finder/finder_stkisu",
+                    "mktsel": "ALL",
+                    "searchText": code,
+                    "typeNo": "0",
+                    "locale": "ko_KR",
+                },
+                headers=headers,
+                timeout=20,
             )
+            finder.raise_for_status()
+        except requests.RequestException as exc:
+            return _empty_short_frame(_krx_data_request_error(
+                "종목 ISIN 조회 실패", exc
+            ))
+        finder_text = finder.text.strip()
+        if (
+            finder_text.upper() == "LOGOUT"
+            or "<html" in finder_text.lower()
+            or "로그인" in finder_text[:500]
+        ):
+            return _empty_short_frame(
+                "KRX Data Marketplace 로그인 필요"
+                + (
+                    f" ({login_status})"
+                    if login_status != "로그인정보 미설정"
+                    else ""
+                )
+            )
+        try:
+            finder_payload = finder.json()
+        except ValueError:
+            return _empty_short_frame("종목 ISIN 응답 형식 오류")
+        matches = (
+            finder_payload.get("block1")
+            or finder_payload.get("output")
+            or []
         )
-    try:
-        finder_payload = finder.json()
-    except ValueError:
-        return _empty_short_frame("종목 ISIN 응답 형식 오류")
-    matches = (
-        finder_payload.get("block1")
-        or finder_payload.get("output")
-        or []
-    )
-    exact = [
-        item for item in matches
-        if str(
-            item.get("short_code")
-            or item.get("shortCode")
-            or item.get("code")
+        exact = [
+            item for item in matches
+            if str(
+                item.get("short_code")
+                or item.get("shortCode")
+                or item.get("code")
+                or ""
+            ).strip() == code
+        ]
+        selected = exact[0] if exact else (matches[0] if matches else {})
+        full_code = str(
+            selected.get("full_code")
+            or selected.get("fullCode")
+            or selected.get("code")
             or ""
-        ).strip() == code
-    ]
-    selected = exact[0] if exact else (matches[0] if matches else {})
-    full_code = str(
-        selected.get("full_code")
-        or selected.get("fullCode")
-        or selected.get("code")
-        or ""
-    ).strip()
+        ).strip()
     if not full_code.startswith("KR"):
         return _empty_short_frame("종목 ISIN을 찾지 못했습니다")
 
@@ -1895,6 +1954,7 @@ def fetch_bundle(
     label: str = "",
     krx_id: str = "",
     krx_pw: str = "",
+    auth_key: str = "",
 ):
     """한 종목의 기본정보·일봉·(한국)수급·공매도를 시장별로 묶는다."""
     market, symbol = split_uid(uid)
@@ -1915,7 +1975,13 @@ def fetch_bundle(
     with ThreadPoolExecutor(max_workers=2) as pool:
         investor_future = pool.submit(fetch_investor_trend, symbol)
         short_future = pool.submit(
-            fetch_short_selling, symbol, 70, krx_id, krx_pw
+            fetch_short_selling,
+            symbol,
+            70,
+            krx_id,
+            krx_pw,
+            auth_key,
+            basic.get("sosok", ""),
         )
         try:
             investor = investor_future.result()
@@ -3919,8 +3985,9 @@ with st.sidebar:
         st.success("KRX Data Marketplace 로그인 설정됨 · 공매도 자동조회")
     else:
         st.caption(
-            "공매도는 익명 자동조회를 먼저 시도합니다. KRX가 로그인을 "
-            "요구하면 Streamlit secrets의 KRX_ID·KRX_PW가 필요합니다."
+            "공매도는 익명 자동조회를 먼저 시도합니다. KRX_ID·KRX_PW는 "
+            "KRX 자체 계정에만 해당하며 네이버 간편로그인 비밀번호는 "
+            "입력하면 안 됩니다."
         )
 
     st.subheader("📄 개별주식선물 종합자료")
@@ -4049,6 +4116,7 @@ with st.spinner(f"{len(uids)}개 종목 자동 분석..."):
                 labels.get(uid, ""),
                 krx_login_id,
                 krx_login_pw,
+                krx_auth_key,
             ): uid
             for uid in uids
         }
@@ -4709,11 +4777,17 @@ else:
         f"공매도 자동수집 실패: {short_status}. "
         "공매도 항목은 중립값으로 계산했습니다."
     )
-    if "로그인" in short_status:
+    if "로그인 필요" in short_status:
         st.caption(
-            "KRX Open API 인증키는 공매도 화면 자료 권한이 아닙니다. "
-            "자동수집을 계속 쓰려면 Streamlit secrets에 KRX_ID와 KRX_PW를 "
-            "설정해야 합니다."
+            "KRX 자체 계정이 있을 때만 Streamlit secrets의 KRX_ID·KRX_PW를 "
+            "사용할 수 있습니다. 네이버 간편로그인 아이디·비밀번호는 입력하지 "
+            "마십시오."
+        )
+    elif "HTTP 403" in short_status:
+        st.caption(
+            "KRX가 Streamlit 서버 요청을 거부했습니다. 종목검색 403은 공식 "
+            "Open API의 ISIN으로 우회하며, 본자료 요청까지 거부되면 공매도 "
+            "CSV 대체수집이 필요합니다."
         )
 
 st.markdown("### 바닥·추세 세부 신호")
