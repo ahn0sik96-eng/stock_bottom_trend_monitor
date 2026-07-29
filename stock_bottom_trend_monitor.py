@@ -1,7 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-개별종목 바닥확인 → 상승추세·매수구간 모니터 v3.2
+개별종목 바닥확인 → 상승추세·매수구간 모니터 v3.3
 ========================================
+2026-07-30 KRX 공식 API 자동수집 수정. v3.2 → v3.3 주요 변경:
+
+  [수정 · KRX 공식 파생 API와 공매도 실패 진단]
+  A. KOSPI/KOSDAQ 개별주식선물 일별 시세를 KRX Open API의
+     eqsfu_stk_bydd_trd/eqkfu_ksq_bydd_trd에서 직접 수집한다.
+  B. 공식 응답의 현물가격·선물종가·거래량·미결제약정으로 베이시스와
+     가격×OI를 계산하며, 거래량이 가장 큰 활성월물을 일관되게 추적한다.
+  C. 공매도 Data Marketplace 호출의 잘못된 _OUT 경로를 수정하고
+     로그인·권한·응답형식 오류를 숨기지 않고 화면에 구체적으로 표시한다.
+
 2026-07-29 현·선물 통합 분석판. v3.1 → v3.2 주요 변경:
 
   [신규 · Hull 기반 현·선물 통합 분석]
@@ -53,7 +63,9 @@
 미국은 인증 불필요. 한국 KRX 인증키는 코드에 넣지 않는다.
 Streamlit Cloud → Settings → Secrets:
 
-    KRX_AUTH_KEY = "발급받은 인증키"        # 한국 KRX 종가 대조용(선택)
+    KRX_AUTH_KEY = "발급받은 인증키"        # 종가·주식선물 Open API
+    KRX_ID = "data.krx.co.kr 아이디"         # 공매도 로그인 요구 시(선택)
+    KRX_PW = "data.krx.co.kr 비밀번호"       # 공매도 로그인 요구 시(선택)
     WATCHLIST = "KR:005930,KR:000660,US:NVDA,US:AVGO"
 
 실행:
@@ -1189,6 +1201,194 @@ def fetch_stock_futures_flow_auto(stock_name: str):
     }
 
 
+def _futures_expiry_from_name(*values):
+    """종목명 끝의 YYYYMM을 주식선물 만기월 둘째 목요일로 변환한다."""
+    for value in values:
+        match = re.search(
+            r"(20\d{2})[\s./_-]?(0[1-9]|1[0-2])",
+            str(value or ""),
+        )
+        if not match:
+            continue
+        year, month = int(match.group(1)), int(match.group(2))
+        first = dt.date(year, month, 1)
+        first_thursday = first + dt.timedelta(
+            days=(3 - first.weekday()) % 7
+        )
+        return pd.Timestamp(first_thursday + dt.timedelta(days=7))
+    return pd.NaT
+
+
+def _stock_futures_row_score(row: dict, stock_name: str):
+    target = _normalized_security_name(stock_name)
+    if not target:
+        return 0.0
+    best = 0.0
+    for key in ("ISU_NM", "PROD_NM"):
+        candidate = _normalized_security_name(row.get(key, ""))
+        if not candidate:
+            continue
+        if candidate == target:
+            best = max(best, 1.0)
+        elif (
+            min(len(candidate), len(target)) >= 3
+            and (candidate in target or target in candidate)
+        ):
+            best = max(
+                best,
+                0.90 + 0.09 * (
+                    min(len(candidate), len(target))
+                    / max(len(candidate), len(target))
+                ),
+            )
+        else:
+            best = max(
+                best,
+                difflib.SequenceMatcher(None, target, candidate).ratio(),
+            )
+    return best
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_stock_futures_market_openapi(
+    auth_key: str,
+    stock_name: str,
+    sosok: str,
+    calendar_days: int = 55,
+):
+    """KRX 공식 Open API에서 활성 주식선물의 가격·거래량·OI를 수집한다."""
+    empty = pd.DataFrame()
+    if not auth_key:
+        return empty, {
+            "status": "KRX Open API 키 미설정",
+            "source": "KRX Open API",
+        }
+    endpoint = (
+        "drv/eqsfu_stk_bydd_trd"
+        if str(sosok) == "0"
+        else "drv/eqkfu_ksq_bydd_trd"
+    )
+    service_name = (
+        "KOSPI 주식선물 일별매매정보"
+        if str(sosok) == "0"
+        else "KOSDAQ 주식선물 일별매매정보"
+    )
+    dates = []
+    cursor = market_today(MARKET_KR)
+    earliest = cursor - dt.timedelta(days=calendar_days)
+    while cursor >= earliest:
+        if cursor.weekday() < 5:
+            dates.append(cursor)
+        cursor -= dt.timedelta(days=1)
+
+    active_code = ""
+    active_name = ""
+    product_name = ""
+    rows_by_date = {}
+    errors = []
+    for base_date in dates:
+        try:
+            rows = _krx_rows(auth_key, endpoint, base_date)
+        except KRXAPIError as exc:
+            message = str(exc)
+            if "401" in message:
+                return empty, {
+                    "status": (
+                        f"Open API 권한 없음: '{service_name}' "
+                        "서비스 이용신청·승인 필요"
+                    ),
+                    "source": "KRX Open API",
+                }
+            errors.append(message)
+            continue
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+            continue
+        rows_by_date[base_date] = rows
+        if active_code:
+            continue
+        candidates = [
+            row for row in rows
+            if _stock_futures_row_score(row, stock_name) >= 0.72
+        ]
+        if not candidates:
+            continue
+        # 동일 기초자산의 여러 월물 중 거래량이 가장 큰 활성월물을 채택한다.
+        active = max(
+            candidates,
+            key=lambda row: (
+                _krx_numeric(row.get("ACC_TRDVOL"))
+                if pd.notna(_krx_numeric(row.get("ACC_TRDVOL")))
+                else -1
+            ),
+        )
+        active_code = str(active.get("ISU_CD", "")).strip()
+        active_name = str(active.get("ISU_NM", "")).strip()
+        product_name = str(active.get("PROD_NM", "")).strip()
+
+    if not active_code:
+        return empty, {
+            "status": (
+                "상장 주식선물 활성월물 매칭 없음"
+                if not errors
+                else " / ".join(dict.fromkeys(errors))[:240]
+            ),
+            "source": "KRX Open API",
+        }
+
+    parsed = []
+    for base_date in reversed(dates):
+        rows = rows_by_date.get(base_date)
+        if rows is None:
+            try:
+                rows = _krx_rows(auth_key, endpoint, base_date)
+            except Exception:
+                continue
+        row = next(
+            (
+                item for item in rows
+                if str(item.get("ISU_CD", "")).strip() == active_code
+            ),
+            None,
+        )
+        if row is None:
+            continue
+        parsed.append({
+            "date": pd.to_datetime(
+                row.get("BAS_DD", base_date.strftime("%Y%m%d")),
+                format="%Y%m%d",
+                errors="coerce",
+            ),
+            "futures_close": _krx_numeric(row.get("TDD_CLSPRC")),
+            "spot_close": _krx_numeric(row.get("SPOT_PRC")),
+            "futures_volume": _krx_numeric(row.get("ACC_TRDVOL")),
+            "open_interest": _krx_numeric(row.get("ACC_OPNINT_QTY")),
+            "expiry_date": _futures_expiry_from_name(
+                row.get("ISU_NM"), row.get("PROD_NM")
+            ),
+        })
+    if not parsed:
+        return empty, {
+            "status": "활성월물 일별 자료 없음",
+            "source": "KRX Open API",
+            "product_id": active_code,
+            "product_name": active_name or product_name,
+        }
+    frame = (
+        pd.DataFrame(parsed)
+        .dropna(subset=["date"])
+        .drop_duplicates("date")
+        .set_index("date")
+        .sort_index()
+    )
+    return frame, {
+        "status": "정상",
+        "source": "KRX Open API",
+        "product_id": active_code,
+        "product_name": active_name or product_name,
+    }
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_kospi200_futures_investor_flow():
     """네이버의 KOSPI200 지수선물 투자자별 일자 순매수를 가져온다."""
@@ -1436,59 +1636,223 @@ def _krx_numeric(value):
     return fnum(value)
 
 
+def _empty_short_frame(status: str, source: str = "KRX Data Marketplace"):
+    frame = pd.DataFrame()
+    frame.attrs.update({"status": status, "source": source})
+    return frame
+
+
+def _krx_data_request_error(prefix: str, exc: Exception):
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code in (401, 403):
+        return (
+            f"{prefix}: KRX Data Marketplace 로그인/접근 권한 필요 "
+            f"(HTTP {status_code})"
+        )
+    detail = str(exc).strip()
+    return (
+        f"{prefix}: {type(exc).__name__}"
+        + (f" ({detail})" if detail else "")
+    )[:300]
+
+
+@st.cache_resource(show_spinner=False)
+def _krx_data_login_cookies(krx_id: str, krx_pw: str):
+    """선택적으로 KRX Data Marketplace 로그인 쿠키를 한 번만 만든다."""
+    if not (krx_id and krx_pw):
+        return {}, "로그인정보 미설정"
+    session = requests.Session()
+    login_page = (
+        "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001.cmd"
+    )
+    login_jsp = (
+        "https://data.krx.co.kr/contents/MDC/COMS/client/view/"
+        "login.jsp?site=mdc"
+    )
+    login_url = (
+        "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd"
+    )
+    headers = {**UA, "Referer": login_page}
+    try:
+        session.get(login_page, headers=UA, timeout=15)
+        session.get(login_jsp, headers=headers, timeout=15)
+        payload = {
+            "mbrNm": "",
+            "telNo": "",
+            "di": "",
+            "certType": "",
+            "mbrId": krx_id,
+            "pw": krx_pw,
+        }
+        response = session.post(
+            login_url, data=payload, headers=headers, timeout=15
+        )
+        data = response.json()
+        if data.get("_error_code") == "CD011":
+            payload["skipDup"] = "Y"
+            response = session.post(
+                login_url, data=payload, headers=headers, timeout=15
+            )
+            data = response.json()
+        if data.get("_error_code") != "CD001":
+            return {}, (
+                "KRX 로그인 실패: "
+                + str(data.get("_error_message") or data.get("_error_code"))
+            )
+        return session.cookies.get_dict(), "정상"
+    except Exception as exc:
+        return {}, f"KRX 로그인 실패: {type(exc).__name__}"
+
+
+def _new_krx_data_session(krx_id: str = "", krx_pw: str = ""):
+    session = requests.Session()
+    loader = (
+        "https://data.krx.co.kr/comm/srt/srtLoader/"
+        "index.cmd?screenId=MDCSTAT300"
+    )
+    try:
+        session.get(loader, headers=UA, timeout=15)
+    except Exception:
+        pass
+    cookies, login_status = _krx_data_login_cookies(krx_id, krx_pw)
+    if cookies:
+        session.cookies.update(cookies)
+    return session, login_status
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_short_selling(code: str, calendar_days: int = 70):
+def fetch_short_selling(
+    code: str,
+    calendar_days: int = 70,
+    krx_id: str = "",
+    krx_pw: str = "",
+):
     """KRX 공매도 종합정보의 일별 거래량·공시 잔고를 가져온다."""
+    session, login_status = _new_krx_data_session(krx_id, krx_pw)
     headers = {
         **UA,
         "Referer": (
             "https://data.krx.co.kr/comm/srt/srtLoader/"
             f"index.cmd?screenId=MDCSTAT300&isuCd={code}"
         ),
+        "X-Requested-With": "XMLHttpRequest",
     }
-    finder = requests.get(
-        KRX_DATA_URL,
-        params={
-            "bld": "dbms/comm/finder/get_srtisu",
-            "isuCd": code,
-            "locale": "ko_KR",
-        },
-        headers=headers,
-        timeout=20,
+    try:
+        finder = session.post(
+            KRX_DATA_URL,
+            data={
+                "bld": "dbms/comm/finder/finder_stkisu",
+                "mktsel": "ALL",
+                "searchText": code,
+                "typeNo": "0",
+                "locale": "ko_KR",
+            },
+            headers=headers,
+            timeout=20,
+        )
+        finder.raise_for_status()
+    except requests.RequestException as exc:
+        return _empty_short_frame(_krx_data_request_error(
+            "종목 ISIN 조회 실패", exc
+        ))
+    finder_text = finder.text.strip()
+    if (
+        finder_text.upper() == "LOGOUT"
+        or "<html" in finder_text.lower()
+        or "로그인" in finder_text[:500]
+    ):
+        return _empty_short_frame(
+            "KRX Data Marketplace 로그인 필요"
+            + (
+                f" ({login_status})"
+                if login_status != "로그인정보 미설정"
+                else ""
+            )
+        )
+    try:
+        finder_payload = finder.json()
+    except ValueError:
+        return _empty_short_frame("종목 ISIN 응답 형식 오류")
+    matches = (
+        finder_payload.get("block1")
+        or finder_payload.get("output")
+        or []
     )
-    finder.raise_for_status()
-    matches = finder.json().get("output", [])
-    if not matches:
-        return pd.DataFrame()
-
-    full_code = str(matches[0].get("code", "")).strip()
-    if not full_code:
-        return pd.DataFrame()
+    exact = [
+        item for item in matches
+        if str(
+            item.get("short_code")
+            or item.get("shortCode")
+            or item.get("code")
+            or ""
+        ).strip() == code
+    ]
+    selected = exact[0] if exact else (matches[0] if matches else {})
+    full_code = str(
+        selected.get("full_code")
+        or selected.get("fullCode")
+        or selected.get("code")
+        or ""
+    ).strip()
+    if not full_code.startswith("KR"):
+        return _empty_short_frame("종목 ISIN을 찾지 못했습니다")
 
     start = TODAY - dt.timedelta(days=calendar_days)
-    response = requests.post(
-        KRX_DATA_URL,
-        params={"bld": "dbms/MDC_OUT/STAT/srt/MDCSTAT30001_OUT"},
-        data={
-            "locale": "ko_KR",
-            "isuCd": full_code,
-            "strtDd": start.strftime("%Y%m%d"),
-            "endDd": TODAY.strftime("%Y%m%d"),
-            "share": "1",
-            "money": "1",
-        },
-        headers=headers,
-        timeout=25,
-    )
-    response.raise_for_status()
-    rows = response.json().get("OutBlock_1", [])
+    try:
+        response = session.post(
+            KRX_DATA_URL,
+            data={
+                "bld": "dbms/MDC/STAT/srt/MDCSTAT30001",
+                "locale": "ko_KR",
+                "isuCd": full_code,
+                "strtDd": start.strftime("%Y%m%d"),
+                "endDd": TODAY.strftime("%Y%m%d"),
+                "share": "1",
+                "money": "1",
+            },
+            headers=headers,
+            timeout=25,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return _empty_short_frame(_krx_data_request_error(
+            "공매도 통계 요청 실패", exc
+        ))
+    text = response.text.strip()
+    if (
+        text.upper() == "LOGOUT"
+        or "<html" in text.lower()
+        or "로그인" in text[:500]
+    ):
+        return _empty_short_frame(
+            "KRX Data Marketplace 로그인 필요"
+            + (
+                f" ({login_status})"
+                if login_status != "로그인정보 미설정"
+                else ""
+            )
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        return _empty_short_frame("공매도 통계 응답 형식 오류")
+    error_message = payload.get("_error_message") or payload.get("message")
+    rows = payload.get("OutBlock_1") or payload.get("output") or []
+    if not isinstance(rows, list) or not rows:
+        return _empty_short_frame(
+            str(error_message or "조회기간 내 공매도 자료 없음")
+        )
+
     parsed = []
     for row in rows:
         try:
             parsed.append({
                 "date": pd.to_datetime(row["TRD_DD"], format="%Y/%m/%d"),
                 "short_volume": _krx_numeric(row.get("CVSRTSELL_TRDVOL")),
-                "uptick_volume": _krx_numeric(row.get("UPTICKRULE_APPL_TRDVOL")),
+                "uptick_volume": _krx_numeric(
+                    row.get("UPTICKRULE_APPL_TRDVOL")
+                ),
                 "exception_volume": _krx_numeric(
                     row.get("UPTICKRULE_EXCPT_TRDVOL")
                 ),
@@ -1499,13 +1863,22 @@ def fetch_short_selling(code: str, calendar_days: int = 70):
         except (KeyError, TypeError, ValueError):
             continue
     if not parsed:
-        return pd.DataFrame()
-    return (
+        return _empty_short_frame("공매도 행 파싱 결과 없음")
+    frame = (
         pd.DataFrame(parsed)
         .drop_duplicates("date")
         .set_index("date")
         .sort_index()
     )
+    frame.attrs.update({
+        "status": "정상",
+        "source": (
+            "KRX Data Marketplace 로그인"
+            if login_status == "정상"
+            else "KRX Data Marketplace"
+        ),
+    })
+    return frame
 
 
 def _fallback_basic(market: str, symbol: str, label: str = ""):
@@ -1517,7 +1890,12 @@ def _fallback_basic(market: str, symbol: str, label: str = ""):
     }
 
 
-def fetch_bundle(uid: str, label: str = ""):
+def fetch_bundle(
+    uid: str,
+    label: str = "",
+    krx_id: str = "",
+    krx_pw: str = "",
+):
     """한 종목의 기본정보·일봉·(한국)수급·공매도를 시장별로 묶는다."""
     market, symbol = split_uid(uid)
     empty_flow = pd.DataFrame(columns=["foreign", "institution", "individual"])
@@ -1536,15 +1914,19 @@ def fetch_bundle(uid: str, label: str = ""):
         basic = _fallback_basic(market, symbol, label)
     with ThreadPoolExecutor(max_workers=2) as pool:
         investor_future = pool.submit(fetch_investor_trend, symbol)
-        short_future = pool.submit(fetch_short_selling, symbol)
+        short_future = pool.submit(
+            fetch_short_selling, symbol, 70, krx_id, krx_pw
+        )
         try:
             investor = investor_future.result()
         except Exception:
             investor = empty_flow
         try:
             short_selling = short_future.result()
-        except Exception:
-            short_selling = pd.DataFrame()
+        except Exception as exc:
+            short_selling = _empty_short_frame(
+                f"공매도 수집 예외: {type(exc).__name__}: {exc}"
+            )
     return basic, history, investor, short_selling
 
 
@@ -1552,6 +1934,7 @@ class KRXAPIError(RuntimeError):
     pass
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
 def _krx_rows(auth_key: str, endpoint: str, base_date: dt.date):
     r = requests.get(
         f"{KRX_API_BASE}/{endpoint}",
@@ -2562,10 +2945,13 @@ def evaluate_short_pressure(
     short_selling: pd.DataFrame,
     raw_history: pd.DataFrame,
 ):
+    source_status = getattr(short_selling, "attrs", {}) or {}
     empty_result = {
         "available": False,
         "label": "데이터 없음",
         "score": 50,
+        "status": source_status.get("status", "응답 없음"),
+        "source": source_status.get("source", "KRX Data Marketplace"),
         "latest_ratio": np.nan,
         "avg5_ratio": np.nan,
         "previous5_ratio": np.nan,
@@ -2680,6 +3066,8 @@ def evaluate_short_pressure(
         "available": True,
         "label": label,
         "score": int(np.clip(score, 0, 100)),
+        "status": source_status.get("status", "정상"),
+        "source": source_status.get("source", "KRX Data Marketplace"),
         "latest_ratio": latest_ratio,
         "avg5_ratio": avg5,
         "previous5_ratio": previous5,
@@ -3422,6 +3810,8 @@ default_watchlist = _secret(
     "KR:005930,KR:000660,KR:005380,US:NVDA,US:AVGO,US:GOOGL",
 )
 krx_auth_key = _secret("KRX_AUTH_KEY")
+krx_login_id = _secret("KRX_ID")
+krx_login_pw = _secret("KRX_PW")
 
 query_watchlist = parse_watchlist(st.query_params.get("stocks", ""))
 if "watchlist_uids" not in st.session_state:
@@ -3520,9 +3910,18 @@ with st.sidebar:
 
     st.divider()
     if krx_auth_key:
-        st.success("KRX 종가 대조용 Open API 키 설정됨 (한국)")
+        st.success("KRX Open API 키 설정됨 · 종가·주식선물 자동조회")
     else:
-        st.info("KRX 종가 대조키 미설정 · 한국 공매도 통계는 자동수집")
+        st.info(
+            "KRX Open API 키 미설정 · 주식선물 가격·거래량·OI 자동조회 불가"
+        )
+    if krx_login_id and krx_login_pw:
+        st.success("KRX Data Marketplace 로그인 설정됨 · 공매도 자동조회")
+    else:
+        st.caption(
+            "공매도는 익명 자동조회를 먼저 시도합니다. KRX가 로그인을 "
+            "요구하면 Streamlit secrets의 KRX_ID·KRX_PW가 필요합니다."
+        )
 
     st.subheader("📄 개별주식선물 종합자료")
     futures_flow_uploads = st.file_uploader(
@@ -3644,7 +4043,13 @@ analyses, failures = {}, {}
 with st.spinner(f"{len(uids)}개 종목 자동 분석..."):
     with ThreadPoolExecutor(max_workers=min(8, len(uids))) as pool:
         future_map = {
-            pool.submit(fetch_bundle, uid, labels.get(uid, "")): uid
+            pool.submit(
+                fetch_bundle,
+                uid,
+                labels.get(uid, ""),
+                krx_login_id,
+                krx_login_pw,
+            ): uid
             for uid in uids
         }
         for future in as_completed(future_map):
@@ -3658,6 +4063,8 @@ with st.spinner(f"{len(uids)}개 종목 자동 분석..."):
                     "source": "",
                 }
                 if market == MARKET_KR:
+                    source_names = []
+                    status_notes = []
                     uploaded_match = match_uploaded_stock_futures(
                         futures_upload_datasets,
                         symbol,
@@ -3666,26 +4073,76 @@ with st.spinner(f"{len(uids)}개 종목 자동 분석..."):
                     )
                     if uploaded_match is not None:
                         stock_futures = uploaded_match["frame"].copy()
-                        stock_futures_meta = {
-                            "status": "정상",
-                            "source": uploaded_match["source"],
+                        source_names.append(uploaded_match["source"])
+                        status_notes.append("업로드 정상")
+                        stock_futures_meta.update({
                             "filename": uploaded_match["filename"],
                             "product_name": (
                                 uploaded_match.get("name")
                                 or basic.get("name", symbol)
                             ),
-                        }
+                        })
                     elif futures_auto_access:
-                        stock_futures, stock_futures_meta = (
+                        flow_frame, flow_meta = (
                             fetch_stock_futures_flow_auto(
                                 basic.get("name", labels.get(uid, symbol))
                             )
                         )
+                        if not flow_frame.empty:
+                            stock_futures = flow_frame.copy()
+                            source_names.append(
+                                flow_meta.get("source", "KRX 투자자통계")
+                            )
+                        status_notes.append(
+                            "투자자수급 " + flow_meta.get("status", "확인불가")
+                        )
                     else:
-                        stock_futures_meta = {
-                            "status": futures_auto_status,
-                            "source": "KRX 자동조회",
-                        }
+                        status_notes.append(
+                            f"투자자수급 {futures_auto_status}"
+                        )
+
+                    market_frame, market_meta = (
+                        fetch_stock_futures_market_openapi(
+                            krx_auth_key,
+                            basic.get("name", labels.get(uid, symbol)),
+                            basic.get("sosok", ""),
+                        )
+                    )
+                    if not market_frame.empty:
+                        # 공식 시세가 업로드 값보다 우선하고 수급 열은 보존한다.
+                        if stock_futures.empty:
+                            stock_futures = market_frame.copy()
+                        else:
+                            stock_futures = stock_futures.reindex(
+                                stock_futures.index.union(market_frame.index)
+                            )
+                            for column in market_frame.columns:
+                                official = market_frame[column]
+                                if column in stock_futures:
+                                    stock_futures[column] = (
+                                        official.combine_first(
+                                            stock_futures[column]
+                                        )
+                                    )
+                                else:
+                                    stock_futures = stock_futures.join(
+                                        official.rename(column), how="outer"
+                                    )
+                        stock_futures = stock_futures.sort_index()
+                        source_names.append("KRX Open API")
+                        for key in (
+                            "product_id", "product_name",
+                        ):
+                            if market_meta.get(key):
+                                stock_futures_meta[key] = market_meta[key]
+                    status_notes.append(
+                        "선물시세 " + market_meta.get("status", "확인불가")
+                    )
+                    stock_futures_meta.update({
+                        "status": " / ".join(status_notes),
+                        "source": " + ".join(dict.fromkeys(source_names))
+                        or "KRX 자동조회",
+                    })
                 if market == MARKET_US:
                     benchmark_name = "S&P500"
                 else:
@@ -4143,7 +4600,8 @@ elif futures_flow["available"]:
     st.caption(
         f"기초자산·상품: {product} · 최근 반영일: "
         f"{latest.strftime('%Y-%m-%d') if latest is not None else '확인불가'}"
-        f" · 출처: {source}"
+        f" · 출처: {source} · 수집상태: "
+        f"{futures_flow.get('status', '확인불가')}"
         + (f" ({filename})" if filename else "")
     )
     st.caption(
@@ -4240,9 +4698,23 @@ elif short_pressure["available"]:
         "KRX+NXT 전체 당일 거래는 통상 18:10 이후, 공매도 잔고는 T+2 지연 반영"
         + stale_note
     )
+    st.caption(
+        f"출처: {short_pressure.get('source', 'KRX Data Marketplace')} · "
+        f"수집상태: {short_pressure.get('status', '정상')}"
+    )
 else:
     st.markdown("### KRX 공매도 압력")
-    st.info("KRX 공매도 통계 응답이 없어 공매도 항목은 중립값으로 계산했습니다.")
+    short_status = short_pressure.get("status", "응답 없음")
+    st.warning(
+        f"공매도 자동수집 실패: {short_status}. "
+        "공매도 항목은 중립값으로 계산했습니다."
+    )
+    if "로그인" in short_status:
+        st.caption(
+            "KRX Open API 인증키는 공매도 화면 자료 권한이 아닙니다. "
+            "자동수집을 계속 쓰려면 Streamlit secrets에 KRX_ID와 KRX_PW를 "
+            "설정해야 합니다."
+        )
 
 st.markdown("### 바닥·추세 세부 신호")
 
@@ -4301,7 +4773,8 @@ else:
 
 source_note = (
     "네이버 장중/일봉·현물 투자자 수급·KOSPI200 선물 수급, "
-    "KRX/HTS 개별주식선물 시세·수급, KRX 공매도 통계와 "
+    "KRX Open API 개별주식선물 시세·거래량·미결제약정, "
+    "KRX/HTS 개별주식선물 투자자 수급, KRX 공매도 통계와 "
     "확정 일별 통계를 대조·가공"
     if sel_market == MARKET_KR
     else "야후 파이낸스 v8 chart(수정주가)를 가공"
