@@ -1,19 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-개별종목 바닥확인 → 상승추세·매수구간 모니터 v3.1
+개별종목 바닥확인 → 상승추세·매수구간 모니터 v3.2
 ========================================
-2026-07-29 개별주식선물 수급 추가판. v3.0 → v3.1 주요 변경:
+2026-07-29 현·선물 통합 분석판. v3.1 → v3.2 주요 변경:
 
-  [신규 · 개별주식선물 외국인/기관 수급]
-  A. 한국 종목은 KRX 주식선물 상품을 자동 매칭하고 외국인·기관의
+  [신규 · Hull 기반 현·선물 통합 분석]
+  A. Hull의 정의에 따라 베이시스를 현물-선물(S-F)로 통일하고
+     선물가격·거래량·미결제약정·만기까지 남은 기간을 함께 분석한다.
+  B. 가격×미결제약정으로 신규계약/청산 가능성을 추정하되, 미결제약정의
+     롱·숏 총수는 항상 같다는 한계를 명시하고 만기 롤오버를 별도 경고한다.
+  C. 현물 외국인·기관, 개별주식선물, KOSPI200 지수선물, 공매도,
+     가격추세·RSI·상대강도·OBV·ATR을 교차 검증하는 종합 근거표를 제공한다.
+  D. KRX의 CP949/EUC-KR, 구분자 차이, 제목행, 2단 헤더를 자동 탐지하고
+     여러 CSV의 수급·가격·거래량·미결제약정 열을 종목·일자별로 병합한다.
+
+  [v3.1 · 개별주식선물 외국인/기관 수급]
+  E. 한국 종목은 KRX 주식선물 상품을 자동 매칭하고 외국인·기관의
      일별 순매수 계약을 현물 수급과 분리해 분석한다.
-  B. KRX 투자자별 파생상품 통계가 로그인 응답으로 제한되는 환경을
+  F. KRX 투자자별 파생상품 통계가 로그인 응답으로 제한되는 환경을
      위해 KRX/HTS 내보내기 CSV 업로드를 지원한다. 종목코드·일자와
      외국인/기관 순매수 열을 자동 인식한다.
-  C. 미결제약정·선물종가가 함께 있으면 가격×미결제약정 조합으로
+  G. 미결제약정·선물종가가 함께 있으면 가격×미결제약정 조합으로
      신규 롱, 숏커버, 신규 숏, 롱청산 가능성을 표시한다. 미결제약정이
      없으면 신규 포지션과 청산을 구분할 수 없다고 명시한다.
-  D. 선물 수급이 있을 때 진입점수 100점 안에서 현물수급·공매도
+  H. 선물 수급이 있을 때 진입점수 100점 안에서 현물수급·공매도
      가중치를 재배분해 선물수급 10점을 반영한다. 데이터가 없으면
      기존 v3.0 점수체계를 그대로 유지한다.
 
@@ -52,7 +62,7 @@ Streamlit Cloud → Settings → Secrets:
 
 import datetime as dt
 import difflib
-from io import BytesIO
+from io import BytesIO, StringIO
 import math
 import os
 import re
@@ -389,6 +399,8 @@ def _compact_text(value) -> str:
 
 def _normalized_security_name(value) -> str:
     text = _compact_text(value)
+    text = re.sub(r"(?:f|선물)?20\d{4}$", "", text)
+    text = re.sub(r"\d{4,6}$", "", text)
     for suffix in ("주식선물", "선물", "보통주", "commonstock"):
         if text.endswith(suffix):
             text = text[: -len(suffix)]
@@ -423,7 +435,7 @@ def _date_series(series: pd.Series) -> pd.Series:
 
 
 def _standardize_stock_futures_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    """KRX/HTS의 wide·long CSV를 공통 선물수급 포맷으로 바꾼다."""
+    """KRX/HTS CSV를 선물수급·가격·거래량·OI 공통 포맷으로 바꾼다."""
     if frame is None or frame.empty:
         return pd.DataFrame()
     frame = frame.copy()
@@ -438,7 +450,10 @@ def _standardize_stock_futures_frame(frame: pd.DataFrame) -> pd.DataFrame:
         } or c.endswith("일자"),
     )
     if date_col is None:
-        raise ValueError("일자 열을 찾지 못했습니다")
+        raise ValueError(
+            "일자 열을 찾지 못했습니다. KRX 조회구분을 '기간합계'가 아닌 "
+            "'일별추이'로 선택해 내려받으세요"
+        )
 
     def is_net_column(compact, subject):
         if subject not in compact:
@@ -459,16 +474,71 @@ def _standardize_stock_futures_frame(frame: pd.DataFrame) -> pd.DataFrame:
     institution_col = _find_column(
         columns, lambda c: is_net_column(c, "기관")
     )
+    foreign_buy_col = _find_column(
+        columns,
+        lambda c: (
+            "외국인" in c and "매수" in c
+            and "순매수" not in c and "순매매" not in c
+        ),
+    )
+    foreign_sell_col = _find_column(
+        columns,
+        lambda c: "외국인" in c and "매도" in c,
+    )
+    institution_buy_col = _find_column(
+        columns,
+        lambda c: (
+            "기관" in c and "매수" in c
+            and "순매수" not in c and "순매매" not in c
+        ),
+    )
+    institution_sell_col = _find_column(
+        columns,
+        lambda c: "기관" in c and "매도" in c,
+    )
 
     dates = _date_series(frame[date_col])
-    standardized = pd.DataFrame(index=dates)
-    standardized.index.name = "date"
+    flow_frame = pd.DataFrame(index=dates)
+    flow_frame.index.name = "date"
+    has_flow = False
 
-    if foreign_col is not None and institution_col is not None:
-        standardized["foreign"] = _numeric_series(frame[foreign_col]).to_numpy()
-        standardized["institution"] = _numeric_series(
-            frame[institution_col]
-        ).to_numpy()
+    if foreign_col is not None or institution_col is not None:
+        flow_frame["foreign"] = (
+            _numeric_series(frame[foreign_col]).to_numpy()
+            if foreign_col is not None
+            else 0.0
+        )
+        flow_frame["institution"] = (
+            _numeric_series(frame[institution_col]).to_numpy()
+            if institution_col is not None
+            else 0.0
+        )
+        has_flow = True
+    elif (
+        foreign_buy_col is not None and foreign_sell_col is not None
+    ) or (
+        institution_buy_col is not None
+        and institution_sell_col is not None
+    ):
+        flow_frame["foreign"] = (
+            (
+                _numeric_series(frame[foreign_buy_col])
+                - _numeric_series(frame[foreign_sell_col])
+            ).to_numpy()
+            if foreign_buy_col is not None
+            and foreign_sell_col is not None
+            else np.zeros(len(frame))
+        )
+        flow_frame["institution"] = (
+            (
+                _numeric_series(frame[institution_buy_col])
+                - _numeric_series(frame[institution_sell_col])
+            ).to_numpy()
+            if institution_buy_col is not None
+            and institution_sell_col is not None
+            else np.zeros(len(frame))
+        )
+        has_flow = True
     else:
         investor_col = _find_column(
             columns,
@@ -483,60 +553,88 @@ def _standardize_stock_futures_frame(frame: pd.DataFrame) -> pd.DataFrame:
                 "순매수" in c or "순매매" in c or c in {"net", "netbuy"}
             ),
         )
-        if investor_col is None or net_col is None:
-            raise ValueError(
-                "외국인·기관 순매수 열 또는 투자자구분·순매수 열을 찾지 못했습니다"
-            )
-        long = pd.DataFrame({
-            "date": dates,
-            "investor": frame[investor_col].astype(str),
-            "net": _numeric_series(frame[net_col]),
-        }).dropna(subset=["date", "net"])
-        investor_compact = long["investor"].map(_compact_text)
-        foreign_total_tokens = {"외국인", "외국인합계", "외국인계"}
-        institution_total_tokens = {"기관", "기관합계", "기관계", "기관투자자"}
-        has_foreign_total = investor_compact.isin(
-            foreign_total_tokens
-        ).any()
-        has_institution_total = investor_compact.isin(
-            institution_total_tokens
-        ).any()
-        institution_tokens = (
-            "기관", "금융투자", "보험", "투신", "사모", "은행",
-            "기타금융", "연기금",
-        )
-        long["type"] = long["investor"].map(
-            lambda value: (
-                "foreign"
-                if (
-                    _compact_text(value) in foreign_total_tokens
-                    if has_foreign_total
-                    else "외국" in _compact_text(value)
+        buy_col = _find_column(
+            columns,
+            lambda c: (
+                (
+                    "매수" in c
+                    and "순매수" not in c
+                    and "순매매" not in c
                 )
-                else "institution"
-                if (
-                    _compact_text(value) in institution_total_tokens
-                    if has_institution_total
-                    else any(
-                        token in _compact_text(value)
-                        for token in institution_tokens
+                or c in {"buy", "buyqty", "매수량", "매수거래량"}
+            ),
+        )
+        sell_col = _find_column(
+            columns,
+            lambda c: (
+                "매도" in c
+                or c in {"sell", "sellqty", "매도량", "매도거래량"}
+            ),
+        )
+        if investor_col is not None and (
+            net_col is not None or (buy_col is not None and sell_col is not None)
+        ):
+            net_values = (
+                _numeric_series(frame[net_col])
+                if net_col is not None
+                else (
+                    _numeric_series(frame[buy_col])
+                    - _numeric_series(frame[sell_col])
+                )
+            )
+            long = pd.DataFrame({
+                "date": dates,
+                "investor": frame[investor_col].astype(str),
+                "net": net_values,
+            }).dropna(subset=["date", "net"])
+            investor_compact = long["investor"].map(_compact_text)
+            foreign_total_tokens = {"외국인", "외국인합계", "외국인계"}
+            institution_total_tokens = {
+                "기관", "기관합계", "기관계", "기관투자자"
+            }
+            has_foreign_total = investor_compact.isin(
+                foreign_total_tokens
+            ).any()
+            has_institution_total = investor_compact.isin(
+                institution_total_tokens
+            ).any()
+            institution_tokens = (
+                "기관", "금융투자", "보험", "투신", "사모", "은행",
+                "기타금융", "연기금",
+            )
+            long["type"] = long["investor"].map(
+                lambda value: (
+                    "foreign"
+                    if (
+                        _compact_text(value) in foreign_total_tokens
+                        if has_foreign_total
+                        else "외국" in _compact_text(value)
                     )
+                    else "institution"
+                    if (
+                        _compact_text(value) in institution_total_tokens
+                        if has_institution_total
+                        else any(
+                            token in _compact_text(value)
+                            for token in institution_tokens
+                        )
+                    )
+                    else ""
                 )
-                else ""
             )
-        )
-        long = long[long["type"] != ""]
-        if long.empty:
-            raise ValueError("외국인·기관 행을 찾지 못했습니다")
-        standardized = (
-            long.pivot_table(
-                index="date", columns="type", values="net", aggfunc="sum"
-            )
-            .rename_axis(None, axis=1)
-        )
-        for required in ("foreign", "institution"):
-            if required not in standardized:
-                standardized[required] = 0.0
+            long = long[long["type"] != ""]
+            if not long.empty:
+                flow_frame = (
+                    long.pivot_table(
+                        index="date", columns="type", values="net",
+                        aggfunc="sum",
+                    )
+                    .rename_axis(None, axis=1)
+                )
+                for required in ("foreign", "institution"):
+                    if required not in flow_frame:
+                        flow_frame[required] = 0.0
+                has_flow = True
 
     oi_col = _find_column(
         columns,
@@ -552,10 +650,73 @@ def _standardize_stock_futures_frame(frame: pd.DataFrame) -> pd.DataFrame:
             or c in {"선물종가", "futuresclose", "futureclose"}
         ),
     )
+    spot_close_col = _find_column(
+        columns,
+        lambda c: (
+            (
+                ("현물" in c or "기초자산" in c)
+                and ("종가" in c or "가격" in c)
+            )
+            or c in {"현물종가", "기초자산종가", "spotclose"}
+        ),
+    )
     if futures_close_col is None:
         futures_close_col = _find_column(
-            columns, lambda c: c in {"종가", "현재가", "close", "price"}
+            columns,
+            lambda c: (
+                c in {"종가", "현재가", "close", "price"}
+                and c != _compact_text(spot_close_col)
+            ),
         )
+    futures_volume_col = _find_column(
+        columns,
+        lambda c: (
+            c in {
+                "거래량", "약정수량", "거래계약수", "volume",
+                "tradingvolume", "acctradvol",
+            }
+            or (
+                ("거래량" in c or "약정수량" in c)
+                and "매수" not in c
+                and "매도" not in c
+            )
+        ),
+    )
+    theoretical_price_col = _find_column(
+        columns,
+        lambda c: (
+            c in {
+                "이론가", "이론가격", "theoreticalprice",
+                "theoreticalfuturesprice",
+            }
+            or ("이론" in c and ("가격" in c or c.endswith("가")))
+        ),
+    )
+    basis_pct_col = _find_column(
+        columns,
+        lambda c: (
+            "베이시스율" in c
+            or c in {"basispct", "basispercent", "basisrate"}
+        ),
+    )
+    basis_col = _find_column(
+        columns,
+        lambda c: (
+            ("시장베이시스" in c or c in {"베이시스", "basis"})
+            and "이론" not in c
+            and "율" not in c
+        ),
+    )
+    expiry_col = _find_column(
+        columns,
+        lambda c: (
+            c in {
+                "만기일", "최종거래일", "결제일", "expiration",
+                "expiry", "expirydate",
+            }
+            or c.endswith("만기일")
+        ),
+    )
 
     extras = pd.DataFrame(index=dates)
     if oi_col is not None:
@@ -564,19 +725,58 @@ def _standardize_stock_futures_frame(frame: pd.DataFrame) -> pd.DataFrame:
         extras["futures_close"] = _numeric_series(
             frame[futures_close_col]
         ).to_numpy()
-    standardized = standardized[~standardized.index.isna()]
-    standardized = (
-        standardized[["foreign", "institution"]]
-        .groupby(level=0)
-        .sum(min_count=1)
-        .sort_index()
-    )
+    if spot_close_col is not None:
+        extras["spot_close"] = _numeric_series(
+            frame[spot_close_col]
+        ).to_numpy()
+    if futures_volume_col is not None:
+        extras["futures_volume"] = _numeric_series(
+            frame[futures_volume_col]
+        ).to_numpy()
+    if theoretical_price_col is not None:
+        extras["theoretical_price"] = _numeric_series(
+            frame[theoretical_price_col]
+        ).to_numpy()
+    if basis_col is not None:
+        extras["reported_basis"] = _numeric_series(
+            frame[basis_col]
+        ).to_numpy()
+    if basis_pct_col is not None:
+        extras["reported_basis_pct"] = _numeric_series(
+            frame[basis_pct_col]
+        ).to_numpy()
+    if expiry_col is not None:
+        extras["expiry_date"] = _date_series(
+            frame[expiry_col]
+        ).to_numpy()
+
+    if not has_flow and extras.empty:
+        raise ValueError(
+            "외국인·기관 수급, 선물종가, 거래량, 미결제약정 또는 "
+            "베이시스 열을 찾지 못했습니다"
+        )
+
+    if has_flow:
+        flow_frame = flow_frame[~flow_frame.index.isna()]
+        standardized = (
+            flow_frame[["foreign", "institution"]]
+            .groupby(level=0)
+            .sum(min_count=1)
+            .sort_index()
+        )
+    else:
+        standardized = pd.DataFrame()
     if not extras.empty:
         extras = extras[~extras.index.isna()].groupby(level=0).last()
-        standardized = standardized.join(extras, how="outer")
-    standardized[["foreign", "institution"]] = standardized[
-        ["foreign", "institution"]
-    ].fillna(0.0)
+        standardized = (
+            extras
+            if standardized.empty
+            else standardized.join(extras, how="outer")
+        )
+    if {"foreign", "institution"}.issubset(standardized.columns):
+        standardized[["foreign", "institution"]] = standardized[
+            ["foreign", "institution"]
+        ].fillna(0.0)
     return standardized
 
 
@@ -590,17 +790,105 @@ def _extract_stock_code(series: pd.Series):
     return unique[0] if len(unique) == 1 else ""
 
 
+def _flatten_csv_columns(columns) -> list:
+    flattened = []
+    for column in columns:
+        parts = column if isinstance(column, tuple) else (column,)
+        clean_parts = []
+        for part in parts:
+            text = str(part).strip()
+            if not text or text.lower().startswith("unnamed"):
+                continue
+            if text not in clean_parts:
+                clean_parts.append(text)
+        flattened.append(" ".join(clean_parts) or "Unnamed")
+    return flattened
+
+
+def _csv_structure_score(frame: pd.DataFrame) -> int:
+    if frame is None or frame.empty or len(frame.columns) < 2:
+        return -100
+    columns = [_compact_text(col) for col in frame.columns]
+    score = 0
+    for column in columns:
+        if (
+            column in {"일자", "날짜", "기준일", "거래일", "거래일자"}
+            or column.endswith("일자")
+            or column in {"trddd", "basdd", "date"}
+        ):
+            score += 15
+        if "외국" in column:
+            score += 5
+        if "기관" in column or "투자자" in column:
+            score += 5
+        if "순매수" in column or "순매매" in column:
+            score += 4
+        if "매수" in column or "매도" in column:
+            score += 1
+        if "미결제약정" in column:
+            score += 6
+        if "베이시스" in column:
+            score += 6
+        if "종가" in column or "가격" in column:
+            score += 3
+        if "거래량" in column or "약정수량" in column:
+            score += 3
+        if "종목명" in column or "기초자산명" in column:
+            score += 2
+        if column.startswith("unnamed"):
+            score -= 1
+    return score
+
+
 def _read_uploaded_csv(uploaded_file):
+    """KRX의 인코딩·구분자·제목행·2단 헤더 차이를 자동 탐색한다."""
     raw = uploaded_file.getvalue()
-    last_error = None
-    for encoding in ("utf-8-sig", "cp949", "euc-kr", "utf-8"):
+    if not raw:
+        raise ValueError("빈 파일입니다")
+    head = raw[:4096].lower()
+    if b"<html" in head or b"<!doctype" in head:
+        raise ValueError(
+            "CSV가 아니라 KRX 로그인/오류 HTML입니다. KRX 화면에서 "
+            "조회 완료 후 다시 다운로드하세요"
+        )
+
+    best_frame, best_score, last_error = None, -1000, None
+    encodings = ("utf-8-sig", "cp949", "euc-kr", "utf-8")
+    separators = (",", "\t", ";", "|", None)
+    for encoding in encodings:
         try:
-            return pd.read_csv(
-                BytesIO(raw), encoding=encoding, sep=None, engine="python"
-            )
-        except Exception as exc:
+            raw.decode(encoding)
+        except UnicodeDecodeError as exc:
             last_error = exc
-    raise ValueError(f"CSV 읽기 실패: {last_error}")
+            continue
+        for separator in separators:
+            for header in range(0, 7):
+                header_options = (header, [header, header + 1])
+                for header_option in header_options:
+                    try:
+                        candidate = pd.read_csv(
+                            BytesIO(raw),
+                            encoding=encoding,
+                            sep=separator,
+                            engine="python",
+                            header=header_option,
+                            on_bad_lines="skip",
+                        )
+                        candidate.columns = _flatten_csv_columns(
+                            candidate.columns
+                        )
+                        candidate = candidate.dropna(how="all")
+                        score = _csv_structure_score(candidate)
+                        if score > best_score:
+                            best_frame, best_score = candidate, score
+                    except Exception as exc:
+                        last_error = exc
+    if best_frame is not None and best_score >= 8:
+        return best_frame
+    raise ValueError(
+        "CSV 열 구조를 판별하지 못했습니다"
+        + (f": {last_error}" if last_error else "")
+    )
 
 
 def parse_stock_futures_uploads(uploaded_files):
@@ -687,9 +975,40 @@ def match_uploaded_stock_futures(
 ):
     if not datasets:
         return None
-    for dataset in datasets:
-        if dataset.get("code") == symbol:
-            return dataset
+
+    def merge_matches(matches):
+        if not matches:
+            return None
+        merged = pd.DataFrame()
+        for dataset in matches:
+            frame = dataset["frame"].copy().sort_index()
+            merged = frame if merged.empty else merged.combine_first(frame)
+        merged = merged.sort_index()
+        names = [
+            item.get("name", "") for item in matches if item.get("name")
+        ]
+        filenames = list(dict.fromkeys(
+            item.get("filename", "") for item in matches
+            if item.get("filename")
+        ))
+        return {
+            "frame": merged,
+            "code": symbol,
+            "name": names[0] if names else stock_name,
+            "filename": ", ".join(filenames),
+            "source": (
+                f"업로드 CSV {len(filenames)}개 병합"
+                if len(filenames) > 1
+                else "업로드 CSV"
+            ),
+        }
+
+    coded = [
+        dataset for dataset in datasets
+        if dataset.get("code") == symbol
+    ]
+    if coded:
+        return merge_matches(coded)
 
     target = _normalized_security_name(stock_name)
     named = []
@@ -704,10 +1023,10 @@ def match_uploaded_stock_futures(
             named.append(dataset)
         elif symbol and symbol in filename:
             named.append(dataset)
-    if len(named) == 1:
-        return named[0]
-    if len(datasets) == 1 and kr_stock_count == 1:
-        return datasets[0]
+    if named:
+        return merge_matches(named)
+    if kr_stock_count == 1:
+        return merge_matches(datasets)
     return None
 
 
@@ -867,6 +1186,95 @@ def fetch_stock_futures_flow_auto(stock_name: str):
         **product,
         "status": status,
         "source": "KRX 자동조회",
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_kospi200_futures_investor_flow():
+    """네이버의 KOSPI200 지수선물 투자자별 일자 순매수를 가져온다."""
+    response = requests.get(
+        "https://finance.naver.com/sise/investorDealTrendDay.naver",
+        params={
+            "bizdate": market_today(MARKET_KR).strftime("%Y%m%d"),
+            "sosok": "03",
+            "page": "1",
+        },
+        headers=UA,
+        timeout=15,
+    )
+    response.raise_for_status()
+    tables = pd.read_html(StringIO(response.text))
+    for table in tables:
+        table = table.copy()
+        table.columns = _flatten_csv_columns(table.columns)
+        date_col = _find_column(
+            table.columns,
+            lambda c: c in {"날짜", "일자", "거래일", "거래일자"},
+        )
+        foreign_col = _find_column(
+            table.columns, lambda c: "외국인" in c
+        )
+        institution_col = _find_column(
+            table.columns,
+            lambda c: c in {"기관계", "기관합계", "기관"},
+        )
+        if not all((date_col, foreign_col, institution_col)):
+            continue
+        raw_dates = table[date_col].astype(str).str.strip()
+        dates = pd.to_datetime(
+            raw_dates, format="%y.%m.%d", errors="coerce"
+        )
+        parsed = pd.DataFrame({
+            "date": dates,
+            "foreign": _numeric_series(table[foreign_col]),
+            "institution": _numeric_series(table[institution_col]),
+        }).dropna(subset=["date"])
+        if not parsed.empty:
+            return (
+                parsed.drop_duplicates("date")
+                .set_index("date")
+                .sort_index()
+            )
+    return pd.DataFrame(columns=["foreign", "institution"])
+
+
+def evaluate_market_futures_flow(frame: pd.DataFrame):
+    empty = {
+        "available": False,
+        "label": "데이터 없음",
+        "foreign5": np.nan,
+        "institution5": np.nan,
+        "foreign_momentum": "데이터 없음",
+        "latest_date": None,
+    }
+    required = {"foreign", "institution"}
+    if frame.empty or not required.issubset(frame.columns):
+        return empty
+    foreign = pd.to_numeric(frame["foreign"], errors="coerce").dropna()
+    institution = pd.to_numeric(
+        frame["institution"], errors="coerce"
+    ).dropna()
+    if foreign.empty or institution.empty:
+        return empty
+    foreign5 = float(foreign.tail(5).sum())
+    institution5 = float(institution.tail(5).sum())
+    if foreign5 > 0 and institution5 > 0:
+        label = "지수선물 동반 순매수"
+    elif foreign5 > 0:
+        label = "지수선물 외국인 순매수"
+    elif foreign5 < 0 and institution5 < 0:
+        label = "지수선물 동반 순매도"
+    elif foreign5 < 0:
+        label = "지수선물 외국인 순매도"
+    else:
+        label = "지수선물 중립"
+    return {
+        "available": True,
+        "label": label,
+        "foreign5": foreign5,
+        "institution5": institution5,
+        "foreign_momentum": _flow_momentum(foreign),
+        "latest_date": frame.index.max(),
     }
 
 
@@ -1584,6 +1992,572 @@ def evaluate_stock_futures_flow(
     }
 
 
+def evaluate_stock_futures_context(
+    stock_futures: pd.DataFrame,
+    raw_history: pd.DataFrame,
+    spot_flow: dict,
+    market_futures: dict,
+):
+    """Hull의 베이시스·수렴·OI 정의를 바탕으로 현물/선물을 종합한다."""
+    flow_result = evaluate_stock_futures_flow(
+        stock_futures, raw_history
+    )
+    series = (
+        stock_futures.copy().sort_index()
+        if stock_futures is not None
+        else pd.DataFrame()
+    )
+    market_columns = {
+        "futures_close", "futures_volume", "open_interest",
+        "reported_basis", "reported_basis_pct", "spot_close",
+        "theoretical_price", "expiry_date",
+    }
+    def has_market_values(column):
+        if column not in series:
+            return False
+        if column == "expiry_date":
+            return pd.to_datetime(
+                series[column], errors="coerce"
+            ).notna().any()
+        return pd.to_numeric(
+            series[column], errors="coerce"
+        ).notna().any()
+
+    market_available = bool(
+        not series.empty
+        and any(has_market_values(column) for column in market_columns)
+    )
+    flow_available = flow_result["available"]
+    available = flow_available or market_available
+
+    defaults = {
+        "available": available,
+        "flow_available": flow_available,
+        "market_data_available": market_available,
+        "basis_available": False,
+        "basis_latest": np.nan,
+        "basis_pct_latest": np.nan,
+        "basis_change": np.nan,
+        "basis_label": "자료 없음",
+        "basis_definition": "Hull 기준: 현물가격 - 선물가격",
+        "volume_available": False,
+        "volume_latest": np.nan,
+        "volume_avg5": np.nan,
+        "volume_ratio20": np.nan,
+        "volume_oi_turnover": np.nan,
+        "activity_label": "자료 없음",
+        "days_to_expiry": np.nan,
+        "near_expiry": False,
+        "rollover_suspected": False,
+        "oi_latest": np.nan,
+        "oi_change": np.nan,
+        "futures_price_change_pct": np.nan,
+        "spot_price_change_pct": np.nan,
+        "futures_spot_spread_pct": np.nan,
+        "theoretical_price_available": False,
+        "theoretical_price_latest": np.nan,
+        "theoretical_gap_latest": np.nan,
+        "theoretical_gap_pct": np.nan,
+        "relation_label": "연계 판정 불가",
+        "integrated_label": (
+            flow_result["label"] if flow_available else "데이터 없음"
+        ),
+        "integrated_interpretation": (
+            "선물 수급·가격·거래량·미결제약정 자료가 부족합니다."
+        ),
+        "diagnostics": [],
+        "market_futures": market_futures,
+        "series": series,
+    }
+    result = {**flow_result, **defaults}
+    if not available:
+        return result
+
+    def lookback_change_pct(values: pd.Series, periods=5):
+        clean = pd.to_numeric(values, errors="coerce").dropna()
+        if len(clean) < 2:
+            return np.nan
+        reference = (
+            float(clean.iloc[-periods - 1])
+            if len(clean) > periods
+            else float(clean.iloc[0])
+        )
+        return (
+            (float(clean.iloc[-1]) / reference - 1) * 100
+            if reference != 0
+            else np.nan
+        )
+
+    if series.empty:
+        series = pd.DataFrame(index=raw_history.index)
+
+    if not raw_history.empty and "close" in raw_history:
+        aligned_spot = pd.to_numeric(
+            raw_history["close"], errors="coerce"
+        ).reindex(series.index)
+        if "spot_close" in series:
+            series["spot_close"] = pd.to_numeric(
+                series["spot_close"], errors="coerce"
+            ).combine_first(aligned_spot)
+        else:
+            series["spot_close"] = aligned_spot
+
+    futures_prices = (
+        pd.to_numeric(series["futures_close"], errors="coerce")
+        if "futures_close" in series
+        else pd.Series(index=series.index, dtype=float)
+    )
+    spot_prices = (
+        pd.to_numeric(series["spot_close"], errors="coerce")
+        if "spot_close" in series
+        else pd.Series(index=series.index, dtype=float)
+    )
+    paired_prices = pd.concat(
+        [
+            spot_prices.rename("spot"),
+            futures_prices.rename("futures"),
+        ],
+        axis=1,
+    ).dropna()
+
+    basis_available = len(paired_prices) >= 1
+    basis_latest = basis_pct_latest = basis_change = np.nan
+    basis_label = "자료 없음"
+    if basis_available:
+        # Hull Ch.3 정의: basis = spot - futures.
+        series["basis"] = spot_prices - futures_prices
+        series["basis_pct"] = (
+            series["basis"] / spot_prices.replace(0, np.nan) * 100
+        )
+        basis_values = series["basis"].dropna()
+        basis_pct_values = series["basis_pct"].dropna()
+        basis_latest = float(basis_values.iloc[-1])
+        basis_pct_latest = float(basis_pct_values.iloc[-1])
+        if len(basis_values) >= 2:
+            reference = (
+                float(basis_values.iloc[-6])
+                if len(basis_values) >= 6
+                else float(basis_values.iloc[0])
+            )
+            basis_change = basis_latest - reference
+        level = (
+            "현물 프리미엄" if basis_latest > 0
+            else "선물 프리미엄" if basis_latest < 0
+            else "현·선물 일치"
+        )
+        movement = (
+            "베이시스 강화" if basis_change > 0
+            else "베이시스 약화" if basis_change < 0
+            else "변화 미미"
+        )
+        basis_label = f"{level}·{movement}"
+    elif "reported_basis" in series:
+        reported = pd.to_numeric(
+            series["reported_basis"], errors="coerce"
+        ).dropna()
+        if not reported.empty:
+            basis_label = "원자료 베이시스(정의 확인 필요)"
+
+    oi_values = (
+        pd.to_numeric(series["open_interest"], errors="coerce").dropna()
+        if "open_interest" in series
+        else pd.Series(dtype=float)
+    )
+    oi_available = len(oi_values) >= 2
+    oi_latest = float(oi_values.iloc[-1]) if len(oi_values) else np.nan
+    oi_change = np.nan
+    oi_change_pct = np.nan
+    if oi_available:
+        reference = (
+            float(oi_values.iloc[-6])
+            if len(oi_values) >= 6
+            else float(oi_values.iloc[0])
+        )
+        oi_change = oi_latest - reference
+        if reference > 0:
+            oi_change_pct = (oi_latest / reference - 1) * 100
+
+    volume_values = (
+        pd.to_numeric(series["futures_volume"], errors="coerce").dropna()
+        if "futures_volume" in series
+        else pd.Series(dtype=float)
+    )
+    volume_available = not volume_values.empty
+    volume_latest = (
+        float(volume_values.iloc[-1]) if volume_available else np.nan
+    )
+    volume_avg5 = (
+        float(volume_values.tail(5).mean())
+        if volume_available else np.nan
+    )
+    volume_avg20 = (
+        float(volume_values.tail(20).mean())
+        if len(volume_values) >= 20 else np.nan
+    )
+    volume_ratio20 = (
+        volume_avg5 / volume_avg20
+        if pd.notna(volume_avg20) and volume_avg20 > 0
+        else np.nan
+    )
+    volume_oi_turnover = (
+        volume_avg5 / oi_latest
+        if pd.notna(volume_avg5)
+        and pd.notna(oi_latest)
+        and oi_latest > 0
+        else np.nan
+    )
+    if not volume_available:
+        activity_label = "거래량 자료 없음"
+    elif pd.notna(volume_ratio20) and volume_ratio20 >= 1.25:
+        if oi_available and oi_change > 0:
+            activity_label = "거래 증가·신규 계약 증가"
+        elif oi_available and oi_change < 0:
+            activity_label = "거래 증가·청산/롤오버 우세"
+        else:
+            activity_label = "거래 증가·포지션 교체 가능"
+    elif oi_available and oi_change > 0:
+        activity_label = "미결제약정 증가·거래 보통"
+    else:
+        activity_label = "거래 활동 보통"
+
+    days_to_expiry = np.nan
+    near_expiry = False
+    if "expiry_date" in series:
+        expiries = pd.to_datetime(
+            series["expiry_date"], errors="coerce"
+        ).dropna()
+        if not expiries.empty and not series.empty:
+            days_to_expiry = (
+                expiries.iloc[-1].date() - series.index.max().date()
+            ).days
+            near_expiry = 0 <= days_to_expiry <= 7
+    rollover_suspected = bool(
+        near_expiry
+        and oi_available
+        and pd.notna(oi_change_pct)
+        and oi_change_pct <= -10
+    )
+    if rollover_suspected:
+        activity_label = "만기근접·롤오버/청산 가능"
+
+    futures_price_change_pct = (
+        lookback_change_pct(futures_prices)
+        if futures_prices.notna().sum() >= 2 else np.nan
+    )
+    spot_price_change_pct = (
+        lookback_change_pct(spot_prices)
+        if spot_prices.notna().sum() >= 2
+        else lookback_change_pct(raw_history["close"])
+        if not raw_history.empty and "close" in raw_history
+        else np.nan
+    )
+    futures_spot_spread_pct = (
+        futures_price_change_pct - spot_price_change_pct
+        if pd.notna(futures_price_change_pct)
+        and pd.notna(spot_price_change_pct)
+        else np.nan
+    )
+    theoretical_prices = (
+        pd.to_numeric(series["theoretical_price"], errors="coerce")
+        if "theoretical_price" in series
+        else pd.Series(index=series.index, dtype=float)
+    )
+    theoretical_pair = pd.concat(
+        [
+            futures_prices.rename("futures"),
+            theoretical_prices.rename("theoretical"),
+        ],
+        axis=1,
+    ).dropna()
+    theoretical_price_available = not theoretical_pair.empty
+    theoretical_price_latest = theoretical_gap_latest = (
+        theoretical_gap_pct
+    ) = np.nan
+    if theoretical_price_available:
+        theoretical_price_latest = float(
+            theoretical_pair["theoretical"].iloc[-1]
+        )
+        theoretical_gap_latest = float(
+            theoretical_pair["futures"].iloc[-1]
+            - theoretical_price_latest
+        )
+        if theoretical_price_latest != 0:
+            theoretical_gap_pct = (
+                theoretical_gap_latest / theoretical_price_latest * 100
+            )
+
+    futures_direction = (
+        1 if flow_available and flow_result["combined5"] > 0
+        else -1 if flow_available and flow_result["combined5"] < 0
+        else 0
+    )
+    spot_direction = (
+        1 if spot_flow.get("available") and spot_flow["combined5"] > 0
+        else -1 if spot_flow.get("available") and spot_flow["combined5"] < 0
+        else 0
+    )
+    if spot_direction > 0 and futures_direction > 0:
+        relation_label = "현·선물 동반 매수"
+    elif spot_direction > 0 and futures_direction < 0:
+        relation_label = "현물 매수·선물 매도"
+    elif spot_direction < 0 and futures_direction > 0:
+        relation_label = "현물 매도·선물 매수"
+    elif spot_direction < 0 and futures_direction < 0:
+        relation_label = "현·선물 동반 매도"
+    else:
+        relation_label = "현·선물 방향 혼재"
+
+    price_direction = (
+        1 if futures_price_change_pct > 0
+        else -1 if futures_price_change_pct < 0
+        else 0
+    )
+    oi_direction = (
+        1 if oi_change > 0 else -1 if oi_change < 0 else 0
+    )
+    if rollover_suspected:
+        position_label = "만기 롤오버 가능·방향판정 보류"
+    elif not oi_available:
+        position_label = "신규·청산 구분 불가"
+    elif price_direction > 0 and oi_direction > 0:
+        position_label = "신규 계약 증가·롱 우세 추정"
+    elif price_direction > 0 and oi_direction < 0:
+        position_label = "기존 포지션 청산·숏커버 추정"
+    elif price_direction < 0 and oi_direction > 0:
+        position_label = "신규 계약 증가·숏 우세 추정"
+    elif price_direction < 0 and oi_direction < 0:
+        position_label = "기존 포지션 청산·롱청산 추정"
+    else:
+        position_label = "가격·미결제약정 혼재"
+
+    score = int(flow_result["score"] if flow_available else 50)
+    if spot_direction > 0 and futures_direction > 0:
+        score += 10
+    elif spot_direction < 0 and futures_direction < 0:
+        score -= 12
+    elif spot_direction > 0 and futures_direction < 0:
+        score -= 4
+
+    if oi_available and not rollover_suspected:
+        if price_direction > 0 and oi_direction > 0:
+            score += 8
+        elif price_direction > 0 and oi_direction < 0:
+            score += 3
+        elif price_direction < 0 and oi_direction > 0:
+            score -= 8
+        elif price_direction < 0 and oi_direction < 0:
+            score -= 4
+    if basis_available and pd.notna(basis_change):
+        if futures_direction > 0 and basis_change < 0:
+            score += 5
+        elif futures_direction < 0 and basis_change > 0:
+            score -= 5
+    if pd.notna(volume_ratio20) and volume_ratio20 >= 1.25:
+        if futures_direction > 0:
+            score += 4
+        elif futures_direction < 0:
+            score -= 4
+    if market_futures.get("available"):
+        market_foreign5 = market_futures.get("foreign5", 0)
+        score += 4 if market_foreign5 > 0 else -4 if market_foreign5 < 0 else 0
+    score = int(np.clip(score, 0, 100))
+
+    if (
+        relation_label == "현물 매수·선물 매도"
+        and basis_available
+        and basis_latest < 0
+    ):
+        integrated_label = "현물매수·선물매도 헤지/차익 가능"
+    elif score >= 70:
+        integrated_label = "상승 포지션 우세"
+    elif score <= 30:
+        integrated_label = "하락·헤지 압력 우세"
+    elif relation_label == "현·선물 동반 매도":
+        integrated_label = "현·선물 위험회피"
+    else:
+        integrated_label = "포지션 혼재·확인 필요"
+
+    explanations = [
+        f"현물과 개별주식선물의 관계는 '{relation_label}'입니다."
+    ]
+    if basis_available:
+        explanations.append(
+            f"Hull 정의(S-F) 베이시스는 {basis_latest:+,.2f}"
+            f"({basis_pct_latest:+.3f}%)이며 {basis_label}입니다."
+        )
+    else:
+        explanations.append(
+            "현물·선물 종가 쌍이 없어 Hull 기준 베이시스를 계산하지 못했습니다."
+        )
+    if theoretical_price_available:
+        explanations.append(
+            f"KRX 이론가 대비 선물 가격 차이는 "
+            f"{theoretical_gap_latest:+,.2f}"
+            f"({theoretical_gap_pct:+.3f}%)입니다. 이는 금리·배당·"
+            "잔존만기가 반영된 공정가치와의 괴리이며 방향성 신호로 "
+            "단독 사용하지 않습니다."
+        )
+    if oi_available:
+        if rollover_suspected:
+            explanations.append(
+                f"만기까지 {days_to_expiry}일이고 미결제약정이 "
+                f"{oi_change_pct:+.2f}% 감소해 방향성 청산보다 "
+                "월물교체 가능성을 우선합니다."
+            )
+        else:
+            explanations.append(
+                f"5일 미결제약정은 {oi_change:+,.0f}계약"
+                f"({oi_change_pct:+.2f}%)으로 '{position_label}'입니다."
+            )
+    else:
+        explanations.append(
+            "미결제약정이 없어 신규 계약과 포지션 청산을 구분할 수 없습니다."
+        )
+    if volume_available and pd.notna(volume_ratio20):
+        explanations.append(
+            f"5일 선물거래량은 20일 평균의 {volume_ratio20:.2f}배로 "
+            f"'{activity_label}'입니다."
+        )
+    elif volume_available:
+        explanations.append(
+            f"최근 5일 선물거래량 평균은 {volume_avg5:,.0f}계약입니다. "
+            "20일 표본이 부족해 장기평균 대비 증감은 판정하지 않았습니다."
+        )
+    if market_futures.get("available"):
+        explanations.append(
+            "시장 보조축인 KOSPI200 지수선물은 "
+            f"'{market_futures['label']}'입니다."
+        )
+    explanations.append(
+        "미결제약정은 동일 계약의 롱·숏 총수가 항상 같으므로, 가격과 "
+        "수급을 결합한 우세 방향은 추정이지 투자자별 잔고 확정치가 아닙니다."
+    )
+
+    diagnostics = [
+        {
+            "항목": "현물 외국인·기관",
+            "판정": spot_flow.get("label", "데이터 없음"),
+            "근거": (
+                f"5일 합계 {spot_flow['combined5']:+,.0f}주"
+                if spot_flow.get("available") else "자료 없음"
+            ),
+        },
+        {
+            "항목": "개별주식선물 수급",
+            "판정": flow_result["label"],
+            "근거": (
+                f"5일 합계 {flow_result['combined5']:+,.0f}계약"
+                if flow_available else "자료 없음"
+            ),
+        },
+        {
+            "항목": "베이시스(S-F)",
+            "판정": basis_label,
+            "근거": (
+                (
+                    f"{basis_latest:+,.2f} / "
+                    f"5일 변화 {basis_change:+,.2f}"
+                    if pd.notna(basis_change)
+                    else f"최근 {basis_latest:+,.2f} / 추세 표본 부족"
+                )
+                if basis_available else "현물·선물 종가 필요"
+            ),
+        },
+        {
+            "항목": "가격×미결제약정",
+            "판정": position_label,
+            "근거": (
+                f"선물 {futures_price_change_pct:+.2f}% / "
+                f"OI {oi_change_pct:+.2f}%"
+                if pd.notna(futures_price_change_pct) and oi_available
+                else "선물종가·미결제약정 필요"
+            ),
+        },
+        {
+            "항목": "이론가 대비",
+            "판정": (
+                "이론가 상회" if theoretical_gap_latest > 0
+                else "이론가 하회" if theoretical_gap_latest < 0
+                else "이론가 부근"
+                if theoretical_price_available
+                else "자료 없음"
+            ),
+            "근거": (
+                f"선물-이론가 {theoretical_gap_latest:+,.2f}"
+                f" ({theoretical_gap_pct:+.3f}%)"
+                if theoretical_price_available
+                else "KRX 이론가 또는 금리·배당·잔존만기 필요"
+            ),
+        },
+        {
+            "항목": "거래 활동",
+            "판정": activity_label,
+            "근거": (
+                f"5일/20일 {volume_ratio20:.2f}배 · "
+                f"거래량/OI {volume_oi_turnover:.2f}"
+                if pd.notna(volume_ratio20)
+                and pd.notna(volume_oi_turnover)
+                else (
+                    f"5일 평균 {volume_avg5:,.0f}계약"
+                    if volume_available
+                    else "선물거래량 자료 필요"
+                )
+            ),
+        },
+        {
+            "항목": "KOSPI200 지수선물",
+            "판정": market_futures.get("label", "데이터 없음"),
+            "근거": (
+                f"외국인 5일 {market_futures['foreign5']:+,.0f}계약"
+                if market_futures.get("available") else "자료 없음"
+            ),
+        },
+    ]
+
+    result.update({
+        "available": True,
+        "score": score,
+        "basis_available": basis_available,
+        "basis_latest": basis_latest,
+        "basis_pct_latest": basis_pct_latest,
+        "basis_change": basis_change,
+        "basis_label": basis_label,
+        "volume_available": volume_available,
+        "volume_latest": volume_latest,
+        "volume_avg5": volume_avg5,
+        "volume_ratio20": volume_ratio20,
+        "volume_oi_turnover": volume_oi_turnover,
+        "activity_label": activity_label,
+        "days_to_expiry": days_to_expiry,
+        "near_expiry": near_expiry,
+        "rollover_suspected": rollover_suspected,
+        "oi_available": oi_available,
+        "oi_latest": oi_latest,
+        "oi_change": oi_change,
+        "oi_change_pct": oi_change_pct,
+        "futures_price_change_pct": futures_price_change_pct,
+        "spot_price_change_pct": spot_price_change_pct,
+        "futures_spot_spread_pct": futures_spot_spread_pct,
+        "theoretical_price_available": theoretical_price_available,
+        "theoretical_price_latest": theoretical_price_latest,
+        "theoretical_gap_latest": theoretical_gap_latest,
+        "theoretical_gap_pct": theoretical_gap_pct,
+        "price_change_pct": futures_price_change_pct,
+        "price_source": "선물" if pd.notna(futures_price_change_pct)
+        else "자료 없음",
+        "position_label": position_label,
+        "relation_label": relation_label,
+        "integrated_label": integrated_label,
+        "integrated_interpretation": " ".join(explanations),
+        "interpretation": " ".join(explanations),
+        "diagnostics": diagnostics,
+        "market_futures": market_futures,
+        "latest_date": series.index.max() if not series.empty else None,
+        "series": series,
+    })
+    return result
+
+
 def evaluate_short_pressure(
     short_selling: pd.DataFrame,
     raw_history: pd.DataFrame,
@@ -1871,7 +2845,7 @@ def build_entry_plan(
         status = "⛔ 신규매수 금지"
         reason = "가격 추세가 아직 하락 중이거나 기존 상승추세가 훼손됐습니다."
     elif (
-        futures_flow["available"]
+        futures_flow["flow_available"]
         and flow["label"] == "동반 매도"
         and futures_flow["score"] <= 30
     ):
@@ -1940,6 +2914,158 @@ def build_entry_plan(
     }
 
 
+def build_integrated_evidence(
+    stage: str,
+    df: pd.DataFrame,
+    rsi: float,
+    rs20: float,
+    benchmark_name: str,
+    flow: dict,
+    futures_flow: dict,
+    short_pressure: dict,
+    entry: dict,
+):
+    """가격·수급·파생·위험 축을 한 표에서 교차 검증한다."""
+    last = df.iloc[-1]
+    close = float(last["close"])
+    volume20 = float(df["volume"].tail(20).mean())
+    volume_ratio = (
+        float(last["volume"]) / volume20 if volume20 > 0 else np.nan
+    )
+    obv_change = (
+        float(last["obv"] - df["obv"].iloc[-6])
+        if len(df) >= 6 else np.nan
+    )
+    atr_pct = (
+        float(last["atr14"]) / close * 100
+        if pd.notna(last["atr14"]) and close > 0 else np.nan
+    )
+    distance_ma20 = (
+        (close / float(last["ma20"]) - 1) * 100
+        if pd.notna(last["ma20"]) and last["ma20"] != 0 else np.nan
+    )
+
+    trend_view = (
+        "우호" if stage in ("바닥 확인", "상승추세")
+        else "관찰" if stage == "바닥 형성 관찰"
+        else "경계"
+    )
+    momentum_view = (
+        "과열 경계" if rsi >= 70
+        else "우호" if rsi >= 45 and last["macd_hist"] > 0
+        else "반등 관찰" if rsi >= 30
+        else "과매도·추세확인 필요"
+    )
+    rs_view = (
+        "시장 대비 우위" if pd.notna(rs20) and rs20 > 0
+        else "시장 대비 열위" if pd.notna(rs20)
+        else "자료 없음"
+    )
+    activity_view = (
+        "수요 확인" if volume_ratio >= 1.3 and obv_change > 0
+        else "매도 압력" if volume_ratio >= 1.3 and obv_change < 0
+        else "활동 보통"
+    )
+    risk_view = (
+        "변동성 높음" if pd.notna(atr_pct) and atr_pct >= 5
+        else "변동성 보통" if pd.notna(atr_pct)
+        else "자료 없음"
+    )
+
+    rows = [
+        {
+            "분석축": "가격 추세·위치",
+            "판정": trend_view,
+            "근거": (
+                f"{stage} · MA20 대비 {distance_ma20:+.2f}% · "
+                f"진입점수 {entry['score']}/100"
+            ),
+        },
+        {
+            "분석축": "모멘텀",
+            "판정": momentum_view,
+            "근거": (
+                f"RSI14 {rsi:.1f} · MACD 히스토그램 "
+                f"{last['macd_hist']:+,.2f}"
+            ),
+        },
+        {
+            "분석축": "현물 거래량·OBV",
+            "판정": activity_view,
+            "근거": (
+                f"거래량/20일 {volume_ratio:.2f}배 · "
+                f"OBV 5일 {obv_change:+,.0f}"
+            ),
+        },
+        {
+            "분석축": "상대강도",
+            "판정": rs_view,
+            "근거": (
+                f"{benchmark_name} 대비 20일 {rs20:+.2f}%p"
+                if pd.notna(rs20) else "기준지수 표본 부족"
+            ),
+        },
+        {
+            "분석축": "현물 외국인·기관",
+            "판정": flow.get("label", "데이터 없음"),
+            "근거": (
+                f"5일 합계 {flow['combined5']:+,.0f}주"
+                if flow.get("available") else "자료 없음"
+            ),
+        },
+        {
+            "분석축": "개별주식선물 종합",
+            "판정": futures_flow.get(
+                "integrated_label", "데이터 없음"
+            ),
+            "근거": (
+                f"{futures_flow.get('relation_label', '연계 판정 불가')} · "
+                f"{futures_flow.get('position_label', '판정 불가')}"
+                if futures_flow.get("available")
+                else "자료 없음"
+            ),
+        },
+        {
+            "분석축": "시장 선물 환경",
+            "판정": futures_flow.get("market_futures", {}).get(
+                "label", "데이터 없음"
+            ),
+            "근거": (
+                f"KOSPI200 외국인 5일 "
+                f"{futures_flow['market_futures']['foreign5']:+,.0f}계약"
+                if futures_flow.get("market_futures", {}).get("available")
+                else "시장 보조자료 없음"
+            ),
+        },
+        {
+            "분석축": "공매도 압력",
+            "판정": short_pressure.get("label", "데이터 없음"),
+            "근거": (
+                f"5일 공매도 비중 {short_pressure['avg5_ratio']:.2f}% · "
+                f"잔고 변화 {short_pressure['balance_change_pct']:+.2f}%"
+                if short_pressure.get("available")
+                and pd.notna(short_pressure.get("avg5_ratio"))
+                and pd.notna(short_pressure.get("balance_change_pct"))
+                else "공매도 비중·잔고 일부 또는 전체 자료 없음"
+            ),
+        },
+        {
+            "분석축": "변동성·추격 위험",
+            "판정": risk_view,
+            "근거": (
+                f"ATR14/종가 {atr_pct:.2f}% · "
+                f"5일 수익률 {entry['return5']:+.2f}%"
+                if pd.notna(atr_pct) else "ATR 표본 부족"
+            ),
+        },
+    ]
+    conclusion = (
+        f"{entry['status']} — {entry['reason']} 각 분석축은 확정 신호가 아니라 "
+        "가격·현물수급·파생 포지션·위험지표 사이의 교차 확인 근거입니다."
+    )
+    return rows, conclusion
+
+
 def _signal(label, passed, detail):
     return {"label": label, "passed": bool(passed), "detail": detail}
 
@@ -1961,6 +3087,7 @@ def evaluate_stock(
     short_selling: pd.DataFrame,
     stock_futures: pd.DataFrame,
     stock_futures_meta: dict,
+    market_futures_data: pd.DataFrame,
     benchmark: pd.DataFrame,
     benchmark_name: str,
 ):
@@ -2014,7 +3141,10 @@ def evaluate_stock(
     flow5 = flow["combined5"]
     flow10 = flow["combined10"]
     flow5_positive = flow_available and flow5 > 0
-    futures_flow = evaluate_stock_futures_flow(stock_futures, raw_history)
+    market_futures = evaluate_market_futures_flow(market_futures_data)
+    futures_flow = evaluate_stock_futures_context(
+        stock_futures, raw_history, flow, market_futures
+    )
     futures_flow.update({
         key: value
         for key, value in (stock_futures_meta or {}).items()
@@ -2023,7 +3153,7 @@ def evaluate_stock(
             "match_score", "filename",
         }
     })
-    futures_available = futures_flow["available"]
+    futures_available = futures_flow["flow_available"]
 
     formation = [
         _signal(
@@ -2235,6 +3365,10 @@ def evaluate_stock(
     entry = build_entry_plan(
         stage, df, flow, futures_flow, short_pressure, market
     )
+    integrated_evidence, integrated_conclusion = build_integrated_evidence(
+        stage, df, rsi, rs20, benchmark_name, flow, futures_flow,
+        short_pressure, entry,
+    )
     drawdown60 = (close / df["high"].tail(60).max() - 1) * 100
     result = {
         "market": market,
@@ -2266,6 +3400,8 @@ def evaluate_stock(
         "futures_flow": futures_flow,
         "short_pressure": short_pressure,
         "entry": entry,
+        "integrated_evidence": integrated_evidence,
+        "integrated_conclusion": integrated_conclusion,
     }
     return result
 
@@ -2276,8 +3412,9 @@ def evaluate_stock(
 st.title("📈 개별종목 상승추세·매수구간 모니터")
 st.caption(
     "한국·미국 개별종목의 바닥·상승추세, 눌림목·돌파 가격, 추격 위험을 판정합니다. "
-    "한국은 현물과 개별주식선물의 외국인·기관 수급, KRX 공매도 압력까지, "
-    "미국은 가격·거래량·상대강도 기반으로 자동 판정합니다."
+    "한국은 현물수급과 개별주식선물의 수급·베이시스·거래량·미결제약정, "
+    "지수선물·공매도·기술지표를 교차 분석하고, 미국은 가격·거래량·상대강도 "
+    "기반으로 자동 판정합니다."
 )
 
 default_watchlist = _secret(
@@ -2387,14 +3524,14 @@ with st.sidebar:
     else:
         st.info("KRX 종가 대조키 미설정 · 한국 공매도 통계는 자동수집")
 
-    st.subheader("📄 개별주식선물 수급")
+    st.subheader("📄 개별주식선물 종합자료")
     futures_flow_uploads = st.file_uploader(
-        "KRX·HTS 수급 CSV",
+        "KRX·HTS CSV(여러 파일 자동 병합)",
         type=["csv"],
         accept_multiple_files=True,
         help=(
-            "일자와 외국인·기관 순매수 계약 열이 필요합니다. 종목코드 또는 "
-            "기초자산명이 있으면 여러 종목을 한 파일에 넣어도 자동 분리합니다."
+            "투자자별 일별 수급 CSV와 선물 일별 시세 CSV를 함께 올릴 수 "
+            "있습니다. 종목코드·기초자산명과 일자를 기준으로 자동 병합합니다."
         ),
     )
     futures_template = pd.DataFrame({
@@ -2403,8 +3540,12 @@ with st.sidebar:
         "일자": ["2026-07-28", "2026-07-29"],
         "외국인순매수": [1200, -350],
         "기관순매수": [-400, 600],
-        "미결제약정": [105000, 106500],
+        "현물종가": [150000, 151200],
         "선물종가": [150200, 151000],
+        "이론가": [150180, 151040],
+        "선물거래량": [28600, 33100],
+        "미결제약정": [105000, 106500],
+        "만기일": ["2026-09-10", "2026-09-10"],
     }).to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         "CSV 양식 받기",
@@ -2413,8 +3554,9 @@ with st.sidebar:
         mime="text/csv",
     )
     st.caption(
-        "미결제약정·선물종가는 선택 열입니다. KRX 자동조회가 제한되면 "
-        "업로드 자료를 우선 사용합니다."
+        "KRX 조회구분은 반드시 '일별추이'로 선택하세요. 수급 CSV만으로도 "
+        "분석되지만, 선물종가·거래량·미결제약정·만기일을 함께 올려야 "
+        "베이시스와 포지션 변화를 종합 판정할 수 있습니다."
     )
     if st.button("🔄 데이터 새로고침"):
         st.cache_data.clear()
@@ -2456,7 +3598,7 @@ else:
     futures_auto_access, futures_auto_status = False, "해당 없음"
 if futures_upload_datasets:
     st.caption(
-        f"개별주식선물 수급 CSV {len(futures_upload_datasets)}개 종목 자료를 "
+        f"개별주식선물 CSV {len(futures_upload_datasets)}개 데이터 묶음을 "
         "우선 반영합니다."
     )
 elif kr_stock_count and not futures_auto_access:
@@ -2486,6 +3628,15 @@ if benchmark_errors:
         + " / ".join(f"{k}({v})" for k, v in benchmark_errors.items())
         + " — 해당 시장 종목의 상대강도는 계산불가로 표시됩니다."
     )
+
+kospi200_futures_flow = pd.DataFrame(
+    columns=["foreign", "institution"]
+)
+if MARKET_KR in markets_present:
+    try:
+        kospi200_futures_flow = fetch_kospi200_futures_investor_flow()
+    except Exception:
+        pass
 
 empty_benchmark = pd.DataFrame(columns=["close"])
 labels = st.session_state["stock_labels"]
@@ -2555,6 +3706,7 @@ with st.spinner(f"{len(uids)}개 종목 자동 분석..."):
                 result = evaluate_stock(
                     basic, conf_hist, conf_inv, short_selling,
                     conf_futures, stock_futures_meta,
+                    kospi200_futures_flow,
                     benchmark_df, benchmark_name,
                 )
                 result["uid"] = uid
@@ -2567,6 +3719,7 @@ with st.spinner(f"{len(uids)}개 종목 자동 분석..."):
                         live = evaluate_stock(
                             basic, history, investor, short_selling,
                             stock_futures, stock_futures_meta,
+                            kospi200_futures_flow,
                             benchmark_df, benchmark_name,
                         )
                         if live["stage"] != result["stage"]:
@@ -2619,7 +3772,7 @@ for uid, result in analyses.items():
         "진입취소선": _money(entry["entry_cancel"], market),
         "현물 외·기 수급": flow["label"],
         "선물 외·기 수급": (
-            futures_flow["label"]
+            futures_flow["integrated_label"]
             if futures_flow["available"]
             else "데이터 없음" if market == MARKET_KR
             else "해당없음"
@@ -2654,8 +3807,8 @@ st.dataframe(
 )
 st.caption(
     "정렬: 진입점수 내림차순 · 현재가·등락률은 실시간, 단계 판정은 시장별 확정 "
-    "종가 기준 · 상대강도는 한국 KOSPI·KOSDAQ / 미국 S&P500 · 개별주식선물 "
-    "수급은 데이터가 있을 때만 10점 비중으로 반영"
+    "종가 기준 · 상대강도는 한국 KOSPI·KOSDAQ / 미국 S&P500 · 한국의 "
+    "개별주식선물 종합점수는 데이터가 있을 때만 10점 비중으로 반영"
 )
 
 options = [uid for uid in uids if uid in analyses]
@@ -2708,8 +3861,8 @@ m4.metric(
     flow["label"] if sel_meta["has_investor_flow"] else "해당없음",
 )
 m5.metric(
-    "선물 외·기 수급",
-    futures_flow["label"]
+    "현·선물 종합",
+    futures_flow["integrated_label"]
     if futures_flow["available"]
     else "데이터 없음" if sel_market == MARKET_KR
     else "해당없음",
@@ -2762,6 +3915,18 @@ component_row = {
 st.dataframe(
     pd.DataFrame([component_row], index=["진입점수 구성"]),
     width="stretch",
+)
+st.markdown("### 종합 교차분석 근거")
+st.dataframe(
+    pd.DataFrame(selected["integrated_evidence"]),
+    width="stretch",
+    hide_index=True,
+)
+st.info(selected["integrated_conclusion"])
+st.caption(
+    "가격 추세를 1차 축으로 두고 모멘텀·현물 거래활동·시장 대비 상대강도, "
+    "현물과 선물 수급, 베이시스·미결제약정, 지수선물·공매도·ATR 위험을 "
+    "교차 확인합니다. 어느 한 지표만으로 매수·매도를 확정하지 않습니다."
 )
 if sel_market == MARKET_US:
     st.caption(
@@ -2826,100 +3991,174 @@ elif flow["available"]:
 else:
     st.info("투자자별 수급 응답이 없어 가격·거래량만으로 진입점수를 계산했습니다.")
 
-st.markdown("### 개별주식선물 외국인·기관 수급")
+st.markdown("### 개별주식선물·현물 연계 종합분석")
 if not sel_meta["has_stock_futures_flow"]:
     st.info("미국 종목은 KRX 개별주식선물 수급 분석 대상이 아닙니다.")
 elif futures_flow["available"]:
-    ff1, ff2, ff3, ff4, ff5 = st.columns(5)
-    ff1.metric("5일 수급", futures_flow["label"])
-    ff2.metric("선물 수급점수", f"{futures_flow['score']}/100")
-    ff3.metric(
-        "외국인 5일",
-        f"{futures_flow['foreign5']:+,.0f}계약",
-    )
+    ff1, ff2, ff3, ff4, ff5, ff6 = st.columns(6)
+    ff1.metric("종합판정", futures_flow["integrated_label"])
+    ff2.metric("선물 종합점수", f"{futures_flow['score']}/100")
+    ff3.metric("현·선물 관계", futures_flow["relation_label"])
     ff4.metric(
-        "기관 5일",
-        f"{futures_flow['institution5']:+,.0f}계약",
-    )
-    ff5.metric(
-        "미결제약정 변화",
+        "베이시스(S-F)",
         (
-            f"{futures_flow['oi_change_pct']:+.2f}%"
-            if futures_flow["oi_available"]
-            else "자료 없음"
+            f"{futures_flow['basis_latest']:+,.2f}"
+            f" ({futures_flow['basis_pct_latest']:+.3f}%)"
+            if futures_flow["basis_available"]
+            else futures_flow["basis_label"]
         ),
     )
-    futures_table = pd.DataFrame([
-        {
-            "주체": "외국인",
-            "최근 5일(계약)": futures_flow["foreign5"],
-            "최근 10일(계약)": futures_flow["foreign10"],
-            "최근 변화": futures_flow["foreign_momentum"],
-        },
-        {
-            "주체": "기관",
-            "최근 5일(계약)": futures_flow["institution5"],
-            "최근 10일(계약)": futures_flow["institution10"],
-            "최근 변화": futures_flow["institution_momentum"],
-        },
-        {
-            "주체": "합계",
-            "최근 5일(계약)": futures_flow["combined5"],
-            "최근 10일(계약)": futures_flow["combined10"],
-            "최근 변화": _flow_momentum(
-                selected["stock_futures"]["foreign"]
-                + selected["stock_futures"]["institution"]
-            ),
-        },
-    ])
-    fc1, fc2 = st.columns([1, 2])
-    with fc1:
-        st.metric("포지션 해석", futures_flow["position_label"])
-        price_change_text = (
-            f"{futures_flow['price_change_pct']:+.2f}%"
-            if pd.notna(futures_flow["price_change_pct"])
-            else "—"
-        )
-        st.metric(
-            f"5일 {futures_flow['price_source']} 가격 변화",
-            price_change_text,
-        )
-    with fc2:
-        st.dataframe(
-            futures_table,
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "최근 5일(계약)": st.column_config.NumberColumn(
-                    format="%+,.0f"
-                ),
-                "최근 10일(계약)": st.column_config.NumberColumn(
-                    format="%+,.0f"
+    ff5.metric(
+        "선물 거래활동",
+        (
+            f"5일/20일 {futures_flow['volume_ratio20']:.2f}배"
+            if pd.notna(futures_flow["volume_ratio20"])
+            else (
+                f"5일 평균 {futures_flow['volume_avg5']:,.0f}"
+                if futures_flow["volume_available"] else "자료 없음"
+            )
+        ),
+    )
+    ff6.metric(
+        "미결제약정 5일",
+        (
+            f"{futures_flow['oi_change']:+,.0f}계약"
+            f" ({futures_flow['oi_change_pct']:+.2f}%)"
+            if futures_flow["oi_available"]
+            else (
+                f"최근 {futures_flow['oi_latest']:,.0f}계약"
+                if pd.notna(futures_flow["oi_latest"])
+                else "자료 없음"
+            )
+        ),
+    )
+
+    st.dataframe(
+        pd.DataFrame(futures_flow["diagnostics"]),
+        width="stretch",
+        hide_index=True,
+    )
+
+    futures_series = futures_flow["series"].copy()
+    if futures_flow["flow_available"]:
+        futures_table = pd.DataFrame([
+            {
+                "주체": "외국인",
+                "최근 5일(계약)": futures_flow["foreign5"],
+                "최근 10일(계약)": futures_flow["foreign10"],
+                "최근 변화": futures_flow["foreign_momentum"],
+            },
+            {
+                "주체": "기관",
+                "최근 5일(계약)": futures_flow["institution5"],
+                "최근 10일(계약)": futures_flow["institution10"],
+                "최근 변화": futures_flow["institution_momentum"],
+            },
+            {
+                "주체": "합계",
+                "최근 5일(계약)": futures_flow["combined5"],
+                "최근 10일(계약)": futures_flow["combined10"],
+                "최근 변화": _flow_momentum(
+                    futures_series["foreign"]
+                    + futures_series["institution"]
                 ),
             },
+        ])
+        fc1, fc2 = st.columns([1, 2])
+        with fc1:
+            st.metric("개별선물 수급", futures_flow["label"])
+            st.metric("가격×OI", futures_flow["position_label"])
+            st.metric(
+                "외국인 5일",
+                f"{futures_flow['foreign5']:+,.0f}계약",
+            )
+            st.metric(
+                "기관 5일",
+                f"{futures_flow['institution5']:+,.0f}계약",
+            )
+        with fc2:
+            st.dataframe(
+                futures_table,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "최근 5일(계약)": st.column_config.NumberColumn(
+                        format="%+,.0f"
+                    ),
+                    "최근 10일(계약)": st.column_config.NumberColumn(
+                        format="%+,.0f"
+                    ),
+                },
+            )
+        flow_chart = (
+            futures_series[["foreign", "institution"]]
+            .dropna(how="all")
+            .tail(20)
+            .rename(columns={"foreign": "외국인", "institution": "기관"})
         )
-    futures_chart = (
-        selected["stock_futures"][["foreign", "institution"]]
-        .tail(20)
-        .rename(columns={"foreign": "외국인", "institution": "기관"})
-    )
-    st.bar_chart(futures_chart, height=220)
-    st.info(futures_flow["interpretation"])
+        if not flow_chart.empty:
+            st.markdown("#### 개별주식선물 투자자 순매수")
+            st.bar_chart(flow_chart, height=220)
+    else:
+        st.info(
+            "선물 시세·거래량·미결제약정은 분석했지만 투자자별 순매수 열은 "
+            "없습니다. KRX 투자자별 일별추이 CSV를 추가하면 현·선물 수급 "
+            "관계까지 판정합니다."
+        )
+
+    chart_columns = []
+    if futures_flow["basis_available"] and "basis" in futures_series:
+        chart_columns.append(("베이시스(S-F)", "basis", "line"))
+    if futures_flow["volume_available"] and "futures_volume" in futures_series:
+        chart_columns.append(("선물 거래량", "futures_volume", "bar"))
+    if pd.notna(futures_flow["oi_latest"]) and "open_interest" in futures_series:
+        chart_columns.append(("미결제약정", "open_interest", "line"))
+    if chart_columns:
+        chart_slots = st.columns(len(chart_columns))
+        for slot, (title, column, kind) in zip(chart_slots, chart_columns):
+            with slot:
+                st.markdown(f"#### {title}")
+                chart_frame = futures_series[[column]].dropna().tail(40)
+                if kind == "bar":
+                    st.bar_chart(chart_frame, height=220)
+                else:
+                    st.line_chart(chart_frame, height=220)
+
+    st.info(futures_flow["integrated_interpretation"])
+    if not futures_flow["market_data_available"]:
+        st.warning(
+            "현재는 투자자 수급 중심 분석입니다. 선물종가·거래량·미결제약정 "
+            "일별 CSV를 추가하면 베이시스, 신규계약/청산, 거래활동을 "
+            "함께 판정합니다."
+        )
+    if futures_flow["rollover_suspected"]:
+        st.warning(
+            "만기 근접과 미결제약정 급감이 겹쳤습니다. 방향성 청산보다 "
+            "차근월물 롤오버 가능성을 먼저 확인하세요."
+        )
     source = futures_flow.get("source") or "출처 확인불가"
     product = futures_flow.get("product_name") or basic["name"]
     latest = futures_flow["latest_date"]
     filename = futures_flow.get("filename")
     st.caption(
         f"기초자산·상품: {product} · 최근 반영일: "
-        f"{latest.strftime('%Y-%m-%d')} · 출처: {source}"
+        f"{latest.strftime('%Y-%m-%d') if latest is not None else '확인불가'}"
+        f" · 출처: {source}"
         + (f" ({filename})" if filename else "")
+    )
+    st.caption(
+        "방법론: Hull, Options, Futures, and Other Derivatives 9판 Ch.2·3·5. "
+        "베이시스는 S-F로 계산하며 만기에 가까워질수록 현·선물 가격이 "
+        "수렴합니다. 거래량은 당일 체결 계약 수, 미결제약정은 남아 있는 "
+        "계약 수이므로 서로 대체할 수 없습니다. 배당·금리·잔존만기가 "
+        "베이시스에 영향을 주기 때문에 부호 하나만으로 방향을 단정하지 않습니다."
     )
 else:
     status = futures_flow.get("status") or "응답 없음"
     st.info(
-        f"개별주식선물 수급 데이터 없음 ({status}). KRX·HTS에서 일자, "
-        "외국인 순매수, 기관 순매수 계약이 포함된 CSV를 내려받아 왼쪽 "
-        "업로더에 넣으면 분석과 진입점수에 반영됩니다."
+        f"개별주식선물 데이터 없음 ({status}). KRX·HTS에서 일별추이로 "
+        "내려받은 투자자별 순매수 CSV와 선물종가·거래량·미결제약정 CSV를 "
+        "왼쪽 업로더에 넣으면 자동 병합해 분석과 진입점수에 반영합니다."
     )
 
 if not sel_meta["has_short_selling"]:
@@ -3061,8 +4300,9 @@ else:
     st.caption("미국 종목: 야후 파이낸스 수정주가 기준 (KRX 대조 없음)")
 
 source_note = (
-    "네이버 장중/일봉·현물 투자자 수급, KRX/HTS 개별주식선물 수급, "
-    "KRX 공매도 통계와 확정 일별 통계를 대조·가공"
+    "네이버 장중/일봉·현물 투자자 수급·KOSPI200 선물 수급, "
+    "KRX/HTS 개별주식선물 시세·수급, KRX 공매도 통계와 "
+    "확정 일별 통계를 대조·가공"
     if sel_market == MARKET_KR
     else "야후 파이낸스 v8 chart(수정주가)를 가공"
 )
