@@ -1,7 +1,47 @@
 # -*- coding: utf-8 -*-
 """
-개별종목 바닥확인 → 상승추세·매수구간 분석기 v3.5
+개별종목 바닥확인 → 상승추세·매수구간 분석기 v3.6
 ========================================
+2026-08-05 v3.5 감사·수정. v3.5 → v3.6 주요 변경:
+
+  [크래시 제거]
+  1. KRX 확정치 종가·등락률이 None일 때 f-string 포맷이 TypeError로
+     페이지 전체를 중단시키던 문제 수정. 동시에 "대조 정상"이라 표기만
+     하고 실제 대조를 하지 않던 부분을 네이버 일봉 실대조로 복원.
+  2. 날짜 표기를 fmt_date로 통일. pd.NaT는 `is not None` 검사를
+     통과한 뒤 strftime에서 ValueError를 내므로 전용 헬퍼로 차단.
+  3. apply_confirmed_cut이 DatetimeIndex가 아닌 프레임에서
+     AttributeError를 내던 문제를 인덱스 강제 변환으로 방지.
+
+  [판정 오류]
+  4. 업로드 선물 CSV 오적용 차단 — 종목코드·종목명이 명시된 자료는
+     현재 종목과 일치할 때만 쓰고, 식별정보가 전혀 없는 자료만
+     현재 종목에 적용한다. 불일치 자료는 화면에 사유를 표시한다.
+  5. 진입점수 가중치 재배분을 "선물 수급(외국인·기관 순매수)이 실제로
+     있을 때"로 한정. 선물 시세·OI만 있는데도 현물수급 20→15,
+     공매도 15→10으로 깎이던 문제 수정.
+  6. RSI14가 14일 내내 하락이 없으면 NaN이 되어 과열 경고·RSI 신호가
+     모두 침묵하던 문제 수정(하락 0 → RSI 100, 무변동 → 50).
+  7. 단계 임계값을 신호 개수에 비례(바닥 50%·상승 60%)하도록 통일.
+     신호가 늘수록 문턱 비율이 낮아지던 비단조성 제거.
+  8. "RSI 과매도 반등" 두 번째 조건에 상한(<70)을 부여. 첫 조건에만
+     상한 60이 있어 RSI 90에서도 통과하던 비대칭 제거.
+  9. 진입점수를 시장별 적용 가능 축으로 정규화. 미국은 현물수급·
+     공매도 축이 구조적으로 없어 최대 83점에 갇혀 있었고, 임계값
+     70/65/55는 시장 공통이라 불리하게 왜곡됐다.
+
+  [표시·정합성]
+  10. NumberColumn format="%+,.0f"는 sprintf 규격에 쉼표 플래그가
+      없어 렌더 오류를 낸다. 문자열 사전 포맷으로 대체.
+  11. 자동수집이 제거된 v3.5 이후에도 남아 있던 "업로드가 자동조회보다
+      우선" 등 사실과 다른 안내문 수정.
+  12. CSV 병합 우선순위를 공매도·선물 모두 "나중 파일 우선"으로 통일.
+  13. 일자 파싱 시 시각 성분을 제거(normalize)해 현물 거래량 조인이
+      조용히 실패하던 경로 차단.
+  14. 업로드 CSV를 dtype=str로 읽어 종목코드 "000660"이 정수 660으로
+      바뀌며 6자리 매칭이 실패하던 문제 수정. 잘린 앞자리 0 복원과
+      ISIN(KR7…) 형식 인식을 _normalize_stock_code로 통합.
+
 2026-07-30 단일 종목·공매도 CSV 분석. v3.4 → v3.5 주요 변경:
 
   [변경 · 종목 한 개씩 분석]
@@ -190,6 +230,23 @@ def _money(value, market: str):
     return f"{value:,.0f}원"
 
 
+def fmt_date(value, empty: str = "—", pattern: str = "%Y-%m-%d"):
+    """날짜 표기 통일. None·NaT·파싱 실패는 모두 empty로 (v3.6 #2).
+
+    pd.NaT는 `is not None`을 통과한 뒤 strftime에서 ValueError를 내므로
+    호출부마다 None 검사만 하면 화면 전체가 죽는다.
+    """
+    if value is None:
+        return empty
+    try:
+        stamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return empty
+    if pd.isna(stamp):
+        return empty
+    return stamp.strftime(pattern)
+
+
 def market_now(market: str) -> dt.datetime:
     return dt.datetime.now(MARKET_META[market]["tz"])
 
@@ -293,10 +350,22 @@ def is_final_quote(traded_at, market: str):
 
 
 def apply_confirmed_cut(frame, market: str, final: bool):
-    """공식 판정용 앵커. 마감 확정 전에는 당일(현지) 행을 제외한다."""
+    """공식 판정용 앵커. 마감 확정 전에는 당일(현지) 행을 제외한다.
+
+    v3.6 #3: 인덱스가 DatetimeIndex가 아니면 `.date` 접근에서
+    AttributeError가 났다. 변환 불가하면 원본을 그대로 돌려준다.
+    """
     if frame is None or frame.empty or final:
         return frame
-    return frame[frame.index.date < market_today(market)]
+    index = frame.index
+    if not isinstance(index, pd.DatetimeIndex):
+        converted = pd.to_datetime(index, errors="coerce")
+        if not isinstance(converted, pd.DatetimeIndex) or converted.isna().all():
+            return frame
+        frame = frame.set_axis(converted)
+    cutoff = pd.Timestamp(market_today(market))
+    keep = frame.index.notna() & (frame.index.normalize() < cutoff)
+    return frame[keep]
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -462,7 +531,9 @@ def _date_series(series: pd.Series) -> pd.Series:
     compact = raw.str.replace(r"[^0-9]", "", regex=True)
     parsed = pd.to_datetime(compact, format="%Y%m%d", errors="coerce")
     fallback = pd.to_datetime(raw, errors="coerce")
-    return parsed.fillna(fallback)
+    merged = parsed.fillna(fallback)
+    # v3.6 #13: 시각 성분이 남으면 일봉 인덱스와 조인이 조용히 실패한다.
+    return merged.dt.normalize()
 
 
 def _standardize_stock_futures_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -811,12 +882,35 @@ def _standardize_stock_futures_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return standardized
 
 
+def _normalize_stock_code(value) -> str:
+    """종목코드 문자열에서 6자리 단축코드를 뽑는다.
+
+    v3.6 #14: 엑셀·CSV가 "000660"을 660으로 저장한 경우까지 살린다.
+    앞자리 0이 잘린 6자리 이하 순수 숫자는 zfill로 복원한다.
+    """
+    text = str(value or "").strip().upper()
+    if not text or text in ("NAN", "NONE"):
+        return ""
+    isin = re.fullmatch(r"KR[0-9A-Z](\d{6})\d{3}", text)
+    if isin:
+        return isin.group(1)
+    match = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
+    if match:
+        return match.group(1)
+    if text.startswith("A") and text[1:].isdigit() and len(text) <= 7:
+        return text[1:].zfill(6)
+    digits = re.sub(r"[^0-9]", "", text)
+    if digits and len(digits) <= 6 and digits == text:
+        return digits.zfill(6)
+    return ""
+
+
 def _extract_stock_code(series: pd.Series):
     values = []
     for value in series.dropna().astype(str):
-        match = re.search(r"(?<!\d)(\d{6})(?!\d)", value)
-        if match:
-            values.append(match.group(1))
+        code = _normalize_stock_code(value)
+        if code:
+            values.append(code)
     unique = list(dict.fromkeys(values))
     return unique[0] if len(unique) == 1 else ""
 
@@ -928,6 +1022,10 @@ def _read_uploaded_csv_bytes(raw: bytes):
                         sep=separator,
                         header=header_option,
                         on_bad_lines="skip",
+                        # v3.6 #14: dtype 추론에 맡기면 종목코드 "000660"이
+                        # 정수 660이 되어 6자리 매칭이 실패한다. 하위 변환은
+                        # 모두 문자열을 받으므로 전부 문자열로 읽는다.
+                        dtype=str,
                     )
                     candidate.columns = _flatten_csv_columns(
                         candidate.columns
@@ -1145,13 +1243,7 @@ def parse_stock_futures_uploads(uploaded_files):
 
             groups = [("", raw)]
             if code_col is not None:
-                def code_from_value(value):
-                    match = re.search(
-                        r"(?<!\d)(\d{6})(?!\d)", str(value)
-                    )
-                    return match.group(1) if match else ""
-
-                valid_codes = raw[code_col].map(code_from_value)
+                valid_codes = raw[code_col].map(_normalize_stock_code)
                 if valid_codes[valid_codes != ""].nunique() > 1:
                     groups = [
                         (code, raw.loc[valid_codes == code].copy())
@@ -1202,8 +1294,12 @@ def match_uploaded_stock_futures(
     stock_name: str,
     kr_stock_count: int,
 ):
+    """업로드 선물 자료를 현재 종목에 매칭한다.
+
+    반환: (매칭 데이터셋 또는 None, 종목 불일치로 제외한 파일 설명 리스트)
+    """
     if not datasets:
-        return None
+        return None, []
 
     def merge_matches(matches):
         if not matches:
@@ -1211,7 +1307,9 @@ def match_uploaded_stock_futures(
         merged = pd.DataFrame()
         for dataset in matches:
             frame = dataset["frame"].copy().sort_index()
-            merged = frame if merged.empty else merged.combine_first(frame)
+            # v3.6 #12: 나중에 올린 파일이 같은 날짜 값을 갱신한다
+            # (공매도 병합과 우선순위를 일치시킨다).
+            merged = frame if merged.empty else frame.combine_first(merged)
         merged = merged.sort_index()
         names = [
             item.get("name", "") for item in matches if item.get("name")
@@ -1232,18 +1330,35 @@ def match_uploaded_stock_futures(
             ),
         }
 
+    def describe(dataset):
+        return (
+            dataset.get("filename", "")
+            or dataset.get("name", "")
+            or dataset.get("code", "")
+            or "이름없는 파일"
+        )
+
     coded = [
         dataset for dataset in datasets
         if dataset.get("code") == symbol
     ]
     if coded:
-        return merge_matches(coded)
+        skipped = [
+            f"{describe(d)}(종목코드 {d.get('code')})"
+            for d in datasets
+            if d.get("code") and d.get("code") != symbol
+        ]
+        return merge_matches(coded), skipped
 
     target = _normalized_security_name(stock_name)
-    named = []
+    named, mismatched = [], []
     for dataset in datasets:
         candidate = _normalized_security_name(dataset.get("name", ""))
         filename = _compact_text(dataset.get("filename", ""))
+        code = dataset.get("code", "")
+        if code and code != symbol:
+            mismatched.append(f"{describe(dataset)}(종목코드 {code})")
+            continue
         if candidate and (
             candidate == target
             or (min(len(candidate), len(target)) >= 3
@@ -1252,11 +1367,24 @@ def match_uploaded_stock_futures(
             named.append(dataset)
         elif symbol and symbol in filename:
             named.append(dataset)
+        elif candidate:
+            mismatched.append(
+                f"{describe(dataset)}(종목명 {dataset.get('name')})"
+            )
     if named:
-        return merge_matches(named)
-    if kr_stock_count == 1:
-        return merge_matches(datasets)
-    return None
+        return merge_matches(named), mismatched
+
+    # v3.6 #4: 종목코드·종목명이 명시된 자료를 현재 종목에 끌어다 쓰면
+    # 다른 종목의 선물 수급이 조용히 섞인다. 식별정보가 전혀 없는
+    # 자료만 현재 분석 종목에 적용한다.
+    unidentified = [
+        dataset for dataset in datasets
+        if not dataset.get("code")
+        and not _normalized_security_name(dataset.get("name", ""))
+    ]
+    if kr_stock_count == 1 and unidentified:
+        return merge_matches(unidentified), mismatched
+    return None, mismatched
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -2163,9 +2291,14 @@ def fetch_bundle(
     krx_id: str = "",
     krx_pw: str = "",
     auth_key: str = "",
-    skip_short: bool = False,
+    skip_short: bool = True,
 ):
-    """한 종목의 기본정보·일봉·(한국)수급·공매도를 시장별로 묶는다."""
+    """한 종목의 기본정보·일봉·(한국)수급·공매도를 시장별로 묶는다.
+
+    v3.5부터 공매도 자동수집은 기본 비활성(skip_short=True)이고 CSV
+    업로드만 사용한다. fetch_short_selling·_krx_data_login_cookies 계열은
+    재활성화를 위해 남겨두었을 뿐 현재 호출 경로가 없다(v3.6 주석).
+    """
     market, symbol = split_uid(uid)
     empty_flow = pd.DataFrame(columns=["foreign", "institution", "individual"])
     if market == MARKET_US:
@@ -2305,7 +2438,13 @@ def add_indicators(df: pd.DataFrame):
     gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
-    out["rsi14"] = 100 - 100 / (1 + rs)
+    rsi = 100 - 100 / (1 + rs)
+    # v3.6 #6: 하락이 전혀 없으면 rs가 발산해 RSI가 NaN이 됐다. NaN이면
+    # 과열 경고·RSI 신호가 전부 조용히 False가 되므로 정의값으로 채운다.
+    no_loss = loss.eq(0) & gain.notna()
+    rsi = rsi.mask(no_loss & gain.gt(0), 100.0)
+    rsi = rsi.mask(no_loss & gain.eq(0), 50.0)
+    out["rsi14"] = rsi
 
     ema12 = out["close"].ewm(span=12, adjust=False).mean()
     ema26 = out["close"].ewm(span=26, adjust=False).mean()
@@ -3413,9 +3552,13 @@ def build_entry_plan(
         else np.nan
     )
     distance_ma20 = (close / ma20 - 1) * 100
+    # v3.6 #5: 가중치·안전판정 모두 "선물 수급이 실제로 있을 때"만 적용한다.
+    # 선물 시세·미결제약정만 있는 경우까지 available로 묶으면 현물수급
+    # 배점이 근거 없이 깎였다.
+    futures_flow_available = bool(futures_flow.get("flow_available"))
     flow_safe = flow["label"] != "동반 매도"
     futures_safe = (
-        not futures_flow["available"] or futures_flow["score"] >= 35
+        not futures_flow_available or futures_flow["score"] >= 35
     )
     short_safe = short_pressure["label"] != "악화"
 
@@ -3477,45 +3620,47 @@ def build_entry_plan(
         volume_component = 9
     else:
         volume_component = 5
-    if futures_flow["available"]:
-        flow_component = int(round(flow["score"] * 0.15))
-        futures_component = int(round(futures_flow["score"] * 0.10))
-        short_component = int(round(short_pressure["score"] * 0.10))
-        component_max = {
-            "추세": 25,
-            "가격위치": 25,
-            "거래량": 15,
-            "현물 외국인·기관": 15,
-            "개별주식선물": 10,
-            "공매도": 10,
-        }
-    else:
-        flow_component = int(round(flow["score"] * 0.20))
-        futures_component = 0
-        short_component = int(round(short_pressure["score"] * 0.15))
-        component_max = {
-            "추세": 25,
-            "가격위치": 25,
-            "거래량": 15,
-            "현물 외국인·기관": 20,
-            "공매도": 15,
-        }
-    score = int(np.clip(
-        trend_component
-        + price_component
-        + volume_component
-        + flow_component
-        + futures_component
-        + short_component,
-        0,
-        100,
-    ))
+    # v3.6 #9: 시장 구조상 존재하지 않는 축(미국의 현물 외국인·기관 구분,
+    # KRX 공매도)은 중립 50점으로 채우지 않고 배점에서 제외한 뒤 100점으로
+    # 정규화한다. 중립 채움은 미국 종목 상한을 83점으로 눌러 임계값
+    # 70/65/55를 시장 공통으로 쓰는 구조와 충돌했다.
+    # 반면 한국인데 API 응답만 없는 일시적 결측은 기존대로 중립 50 유지.
+    meta = MARKET_META.get(market, MARKET_META[MARKET_KR])
+    components = {
+        "추세": trend_component,
+        "가격위치": price_component,
+        "거래량": volume_component,
+    }
+    component_max = {"추세": 25, "가격위치": 25, "거래량": 15}
+    if meta["has_investor_flow"]:
+        weight = 0.15 if futures_flow_available else 0.20
+        components["현물 외국인·기관"] = int(round(flow["score"] * weight))
+        component_max["현물 외국인·기관"] = int(round(100 * weight))
+    if futures_flow_available:
+        components["개별주식선물"] = int(round(futures_flow["score"] * 0.10))
+        component_max["개별주식선물"] = 10
+    if meta["has_short_selling"]:
+        weight = 0.10 if futures_flow_available else 0.15
+        components["공매도"] = int(round(short_pressure["score"] * weight))
+        component_max["공매도"] = int(round(100 * weight))
+
+    raw_total = sum(components.values())
+    raw_max = sum(component_max.values())
+    score = (
+        int(np.clip(round(raw_total / raw_max * 100), 0, 100))
+        if raw_max else 0
+    )
+    score_basis = (
+        f"적용 배점 {raw_total}/{raw_max} → 100점 환산"
+        if raw_max != 100
+        else f"{raw_total}/100"
+    )
 
     if stage in ("하락 진행", "추세 훼손"):
         status = "⛔ 신규매수 금지"
         reason = "가격 추세가 아직 하락 중이거나 기존 상승추세가 훼손됐습니다."
     elif (
-        futures_flow["flow_available"]
+        futures_flow_available
         and flow["label"] == "동반 매도"
         and futures_flow["score"] <= 30
     ):
@@ -3557,19 +3702,9 @@ def build_entry_plan(
         "breakout_confirmed": breakout_confirmed,
         "pullback_ready": pullback_ready,
         "extended": extended,
-        "components": {
-            "추세": trend_component,
-            "가격위치": price_component,
-            "거래량": volume_component,
-            "현물 외국인·기관": flow_component,
-            **(
-                {"개별주식선물": futures_component}
-                if futures_flow["available"]
-                else {}
-            ),
-            "공매도": short_component,
-        },
+        "components": components,
         "component_max": component_max,
+        "score_basis": score_basis,
         "buy_condition": (
             f"눌림목 {_money(pullback_low, market)}~"
             f"{_money(pullback_high, market)}에서 "
@@ -3736,6 +3871,18 @@ def build_integrated_evidence(
     return rows, conclusion
 
 
+def _signed_text(value, unit: str = ""):
+    """표 표시용 부호 포함 문자열.
+
+    v3.6 #10: st.column_config.NumberColumn(format=...)은 sprintf 규격을
+    따르는데 쉼표 플래그가 없어 "%+,.0f"는 렌더 오류를 낸다. 파이썬에서
+    미리 문자열로 만들어 넣는다.
+    """
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{float(value):+,.0f}{unit}"
+
+
 def _signal(label, passed, detail):
     return {"label": label, "passed": bool(passed), "detail": detail}
 
@@ -3780,9 +3927,11 @@ def evaluate_stock(
     days_since_low = len(df.loc[low60_date:]) - 1
     no_new_low = days_since_low >= 3
 
-    rsi_rebound = (
-        (rsi >= 35 and rsi <= 60 and rsi > df["rsi14"].iloc[-4])
-        or ((df["rsi14"].tail(10).min() < 30) and rsi > 30)
+    # v3.6 #8: 두 번째 조건에도 상한을 둔다. 첫 조건만 60 상한이 있어
+    # "10일 내 RSI<30 → 현재 RSI 90"도 '과매도 반등'으로 통과했다.
+    rsi_rebound = bool(
+        (35 <= rsi <= 60 and rsi > df["rsi14"].iloc[-4])
+        or ((df["rsi14"].tail(10).min() < 30) and 30 < rsi < 70)
     )
     ma5_recovery = close > last["ma5"] and last["ma5"] > df["ma5"].iloc[-4]
 
@@ -4002,9 +4151,12 @@ def evaluate_stock(
         & (df["ma20"] > df["ma20"].shift(5))
     ).tail(20).fillna(False).any()
 
-    # 수급 신호가 빠진 미국은 만점이 낮으므로 임계값을 비례 조정 (v3.0 #D)
-    form_threshold = 3 if formation_max >= 6 else max(2, round(formation_max * 0.5))
-    up_threshold = 3 if uptrend_max >= 5 else max(2, round(uptrend_max * 0.6))
+    # v3.6 #7: 신호 개수에 비례한 고정 비율로 통일한다. 기존 식은
+    # formation 5→40%, 6→50%, 7→43% / uptrend 4→50%, 5→60%, 6→50%로
+    # 신호가 늘수록 문턱 비율이 낮아져(= 판정이 쉬워져) 선물 CSV를
+    # 올리는 것만으로 단계가 올라갈 수 있었다.
+    form_threshold = max(2, math.ceil(formation_max * 0.5))
+    up_threshold = max(2, math.ceil(uptrend_max * 0.6))
 
     if historical_uptrend and breakdown_score >= 2:
         stage = "추세 훼손"
@@ -4262,8 +4414,9 @@ with st.sidebar:
         )
         st.caption(
             "KRX 정보데이터시스템 → 공매도 → 개별종목 공매도 종합정보 → "
-            "기간 조회 → CSV 다운로드 순서입니다. 업로드 자료가 자동조회보다 "
-            "우선합니다."
+            "기간 조회 → CSV 다운로드 순서입니다. v3.5부터 공매도 "
+            "자동수집은 사용하지 않으므로, CSV를 올리지 않으면 공매도 축은 "
+            "중립으로 계산합니다."
         )
 
     if st.button("🔄 데이터 새로고침"):
@@ -4362,6 +4515,7 @@ if MARKET_KR in markets_present:
 empty_benchmark = pd.DataFrame(columns=["close"])
 labels = st.session_state["stock_labels"]
 analyses, failures = {}, {}
+futures_skip_notes = []
 with st.spinner("선택 종목 분석 중..."):
     with ThreadPoolExecutor(max_workers=min(8, len(uids))) as pool:
         future_map = {
@@ -4372,7 +4526,7 @@ with st.spinner("선택 종목 분석 중..."):
                 krx_login_id,
                 krx_login_pw,
                 krx_auth_key,
-                split_uid(uid)[0] == MARKET_KR,
+                True,  # skip_short: v3.5부터 공매도는 CSV 업로드만 사용
             ): uid
             for uid in uids
         }
@@ -4399,12 +4553,16 @@ with st.spinner("선택 종목 분석 중..."):
                 if market == MARKET_KR:
                     source_names = []
                     status_notes = []
-                    uploaded_match = match_uploaded_stock_futures(
-                        futures_upload_datasets,
-                        symbol,
-                        basic.get("name", labels.get(uid, symbol)),
-                        kr_stock_count,
+                    uploaded_match, skipped_futures = (
+                        match_uploaded_stock_futures(
+                            futures_upload_datasets,
+                            symbol,
+                            basic.get("name", labels.get(uid, symbol)),
+                            kr_stock_count,
+                        )
                     )
+                    if skipped_futures:
+                        futures_skip_notes.extend(skipped_futures)
                     if uploaded_match is not None:
                         stock_futures = uploaded_match["frame"].copy()
                         source_names.append(uploaded_match["source"])
@@ -4523,6 +4681,12 @@ with st.spinner("선택 종목 분석 중..."):
             except Exception as exc:
                 failures[uid] = str(exc)
 
+if futures_skip_notes:
+    st.warning(
+        "다른 종목으로 표시된 선물 CSV는 적용하지 않았습니다: "
+        + " / ".join(dict.fromkeys(futures_skip_notes))
+        + " — 현재 분석 종목의 자료만 올리세요."
+    )
 if failures:
     st.warning(
         "분석 제외: "
@@ -4627,12 +4791,18 @@ st.caption(
 )
 
 component_row = {
-    key: f"{value}/{entry['component_max'][key]}"
+    key: f"{value}/{entry['component_max'].get(key, '—')}"
     for key, value in entry["components"].items()
 }
 st.dataframe(
     pd.DataFrame([component_row], index=["진입점수 구성"]),
     width="stretch",
+)
+st.caption(
+    f"진입점수 {entry['score']}/100 · {entry.get('score_basis', '—')} — "
+    "해당 시장에 존재하지 않는 축은 중립값으로 채우지 않고 배점에서 빼고 "
+    "100점으로 환산합니다(v3.6). 한국인데 응답만 없는 일시적 결측은 "
+    "기존대로 중립 50으로 둡니다."
 )
 st.markdown("### 종합 교차분석 근거")
 st.dataframe(
@@ -4648,9 +4818,10 @@ st.caption(
 )
 if sel_market == MARKET_US:
     st.caption(
-        "미국 종목은 현물 외국인·기관 구분 수급과 공매도가 중립값(각 10·8점), "
-        "개별주식선물 수급은 점수 구성에서 제외됩니다. 추세·가격·거래량 "
-        "중심으로 보세요."
+        "미국 종목은 현물 외국인·기관 구분 수급, KRX 공매도, 개별주식선물이 "
+        "구조적으로 없어 점수 축에서 제외하고 추세·가격위치·거래량 65점을 "
+        "100점으로 환산합니다. v3.5까지는 없는 축을 중립 50으로 채워 상한이 "
+        "83점에 갇혔고, 임계값 70/65/55는 시장 공통이라 미국이 불리했습니다."
     )
 
 st.info(selected["action"])
@@ -4665,23 +4836,23 @@ elif flow["available"]:
     flow_table = pd.DataFrame([
         {
             "주체": "외국인",
-            "최근 5일(주)": flow["foreign5"],
-            "최근 10일(주)": flow["foreign10"],
+            "최근 5일(주)": _signed_text(flow["foreign5"]),
+            "최근 10일(주)": _signed_text(flow["foreign10"]),
             "최근 변화": flow["foreign_momentum"],
         },
         {
             "주체": "기관",
-            "최근 5일(주)": flow["institution5"],
-            "최근 10일(주)": flow["institution10"],
+            "최근 5일(주)": _signed_text(flow["institution5"]),
+            "최근 10일(주)": _signed_text(flow["institution10"]),
             "최근 변화": flow["institution_momentum"],
         },
         {
             "주체": "합계",
-            "최근 5일(주)": flow["combined5"],
-            "최근 10일(주)": flow["combined10"],
+            "최근 5일(주)": _signed_text(flow["combined5"]),
+            "최근 10일(주)": _signed_text(flow["combined10"]),
             "최근 변화": _flow_momentum(
-                selected["investor"]["foreign"]
-                + selected["investor"]["institution"]
+                selected["investor"]["foreign"].fillna(0)
+                + selected["investor"]["institution"].fillna(0)
             ),
         },
     ])
@@ -4690,18 +4861,10 @@ elif flow["available"]:
         st.metric("줄다리기 판정", flow["label"])
         st.metric("수급점수", f"{flow['score']}/100")
         st.caption(
-            f"최근 반영일: {flow['latest_date'].strftime('%Y-%m-%d')}"
+            f"최근 반영일: {fmt_date(flow['latest_date'])}"
         )
     with f2:
-        st.dataframe(
-            flow_table,
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "최근 5일(주)": st.column_config.NumberColumn(format="%+,.0f"),
-                "최근 10일(주)": st.column_config.NumberColumn(format="%+,.0f"),
-            },
-        )
+        st.dataframe(flow_table, width="stretch", hide_index=True)
     flow_chart = selected["investor"][["foreign", "institution"]].tail(20).rename(
         columns={"foreign": "외국인", "institution": "기관"}
     )
@@ -4762,23 +4925,23 @@ elif futures_flow["available"]:
         futures_table = pd.DataFrame([
             {
                 "주체": "외국인",
-                "최근 5일(계약)": futures_flow["foreign5"],
-                "최근 10일(계약)": futures_flow["foreign10"],
+                "최근 5일(계약)": _signed_text(futures_flow["foreign5"]),
+                "최근 10일(계약)": _signed_text(futures_flow["foreign10"]),
                 "최근 변화": futures_flow["foreign_momentum"],
             },
             {
                 "주체": "기관",
-                "최근 5일(계약)": futures_flow["institution5"],
-                "최근 10일(계약)": futures_flow["institution10"],
+                "최근 5일(계약)": _signed_text(futures_flow["institution5"]),
+                "최근 10일(계약)": _signed_text(futures_flow["institution10"]),
                 "최근 변화": futures_flow["institution_momentum"],
             },
             {
                 "주체": "합계",
-                "최근 5일(계약)": futures_flow["combined5"],
-                "최근 10일(계약)": futures_flow["combined10"],
+                "최근 5일(계약)": _signed_text(futures_flow["combined5"]),
+                "최근 10일(계약)": _signed_text(futures_flow["combined10"]),
                 "최근 변화": _flow_momentum(
-                    futures_series["foreign"]
-                    + futures_series["institution"]
+                    futures_series["foreign"].fillna(0)
+                    + futures_series["institution"].fillna(0)
                 ),
             },
         ])
@@ -4795,19 +4958,7 @@ elif futures_flow["available"]:
                 f"{futures_flow['institution5']:+,.0f}계약",
             )
         with fc2:
-            st.dataframe(
-                futures_table,
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "최근 5일(계약)": st.column_config.NumberColumn(
-                        format="%+,.0f"
-                    ),
-                    "최근 10일(계약)": st.column_config.NumberColumn(
-                        format="%+,.0f"
-                    ),
-                },
-            )
+            st.dataframe(futures_table, width="stretch", hide_index=True)
         flow_chart = (
             futures_series[["foreign", "institution"]]
             .dropna(how="all")
@@ -4860,7 +5011,7 @@ elif futures_flow["available"]:
     filename = futures_flow.get("filename")
     st.caption(
         f"기초자산·상품: {product} · 최근 반영일: "
-        f"{latest.strftime('%Y-%m-%d') if latest is not None else '확인불가'}"
+        f"{fmt_date(latest, '확인불가')}"
         f" · 출처: {source} · 수집상태: "
         f"{futures_flow.get('status', '확인불가')}"
         + (f" ({filename})" if filename else "")
@@ -4953,9 +5104,9 @@ elif short_pressure["available"]:
     )
     st.caption(
         "공매도 거래 최근일 "
-        f"{trade_date.strftime('%Y-%m-%d') if trade_date is not None else '—'} · "
+        f"{fmt_date(trade_date)} · "
         "잔고 공시 최근일 "
-        f"{balance_date.strftime('%Y-%m-%d') if balance_date is not None else '—'} · "
+        f"{fmt_date(balance_date)} · "
         "KRX+NXT 전체 당일 거래는 통상 18:10 이후, 공매도 잔고는 T+2 지연 반영"
         + stale_note
     )
@@ -4976,17 +5127,14 @@ else:
             f"공매도 CSV 처리 실패: {short_status}. "
             "공매도 항목은 중립값으로 계산했습니다."
         )
-    if "로그인 필요" in short_status:
+    # v3.6 #11: 자동수집이 제거된 v3.5 이후 '로그인 필요'·'HTTP 403'
+    # 상태는 발생할 수 없다. 실제로 나올 수 있는 CSV 파싱 실패만 안내한다.
+    if short_status != "공매도 CSV 미업로드":
         st.caption(
-            "KRX 자체 계정이 있을 때만 Streamlit secrets의 KRX_ID·KRX_PW를 "
-            "사용할 수 있습니다. 네이버 간편로그인 아이디·비밀번호는 입력하지 "
-            "마십시오."
-        )
-    elif "HTTP 403" in short_status:
-        st.caption(
-            "KRX가 Streamlit 서버 요청을 거부했습니다. 종목검색 403은 공식 "
-            "Open API의 ISIN으로 우회하며, 본자료 요청까지 거부되면 공매도 "
-            "CSV 대체수집이 필요합니다."
+            "CSV는 KRX 화면에서 조회를 끝낸 뒤 내려받아야 합니다. 조회 전 "
+            "받은 파일은 CSV가 아니라 HTML이라 열 구조를 찾지 못합니다. "
+            "'일자'와 '공매도 거래량' 또는 '순보유잔고 수량' 열이 있어야 "
+            "합니다."
         )
 
 st.markdown("### 바닥·추세 세부 신호")
@@ -5035,10 +5183,35 @@ with c2:
 if sel_meta["has_krx_confirm"]:
     krx = fetch_krx_confirmation(krx_auth_key, sel_symbol, basic.get("sosok", ""))
     if krx.get("status") == "정상":
-        st.success(
-            f"KRX 공식 확정치 대조 정상 · {krx['date']} 종가 "
-            f"{krx['close']:,.0f}원 / 등락률 {krx['change_pct']:+.2f}%"
+        # v3.6 #1: close·change_pct가 None이면 이전 판은 f-string에서
+        # TypeError로 페이지 전체가 죽었다. 또한 "대조 정상"이라고만
+        # 적고 실제 비교는 하지 않았으므로 네이버 일봉과 실대조한다.
+        krx_close = krx.get("close")
+        krx_change = krx.get("change_pct")
+        base_text = (
+            f"KRX 공식 확정치 {fmt_date(krx.get('date'))} · 종가 "
+            f"{_money(krx_close, MARKET_KR) if krx_close is not None else '—'}"
+            f" / 등락률 "
+            f"{f'{krx_change:+.2f}%' if krx_change is not None else '—'}"
         )
+        krx_stamp = pd.Timestamp(krx["date"]) if krx.get("date") else None
+        naver_close = (
+            float(history.loc[krx_stamp, "close"])
+            if krx_stamp is not None and krx_stamp in history.index
+            else None
+        )
+        if naver_close is not None and krx_close is not None:
+            tolerance = max(1.0, abs(krx_close) * 0.001)
+            if abs(naver_close - krx_close) <= tolerance:
+                st.success(base_text + " · 네이버 일봉과 일치")
+            else:
+                st.warning(
+                    base_text
+                    + f" · 네이버 일봉({_money(naver_close, MARKET_KR)})과 "
+                    "불일치 — 수정주가·기준일 차이 가능성, 원천 확인 필요"
+                )
+        else:
+            st.info(base_text + " · 같은 일자의 일봉이 없어 대조는 못 했습니다")
     else:
         st.caption(f"KRX 공식 확정치: {krx.get('status', '확인불가')}")
 else:
